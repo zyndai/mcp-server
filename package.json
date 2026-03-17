@@ -1,0 +1,53 @@
+{
+  "name": "zyndai-mcp-server",
+  "version": "1.0.1",
+  "description": "MCP server for the ZyndAI agent network — search, browse, and call agents with x402 micropayments",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "zyndai-mcp-server": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "pnpm build"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "zyndai",
+    "ai-agents",
+    "agent-discovery",
+    "x402",
+    "micropayments"
+  ],
+  "author": "ZyndAI",
+  "homepage": "https://github.com/0xSY3/zyndai-mcp-server",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/0xSY3/zyndai-mcp-server.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@x402/core": "^2.5.0",
+    "@x402/evm": "^2.5.0",
+    "@x402/fetch": "^2.5.0",
+    "viem": "^2.31.3",
+    "zod": "^3.25.23"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
