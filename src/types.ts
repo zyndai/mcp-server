@@ -1,55 +1,60 @@
-export interface Agent {
-  id: string;
-  name: string;
-  description: string | null;
-  capabilities: Record<string, unknown> | null;
-  status: AgentStatus;
-  didIdentifier: string;
-  did: string;
-  httpWebhookUrl: string | null;
-  mqttUri: string | null;
-  inboxTopic: string | null;
-  lastHealthCheckAt: string | null;
-  createdAt: string;
-  updatedAt: string;
+/**
+ * MCP-local types. Anything that describes the AgentDNS wire format is
+ * imported from the `zyndai` SDK — keeping it in one place avoids drift.
+ */
+
+import type { EntityCard, AgentSearchResponse } from "zyndai";
+
+export type { EntityCard, AgentSearchResponse } from "zyndai";
+
+/**
+ * The two shapes of "agent" we hand back to the model:
+ *   - SearchResultRow  — what a search hit looks like (terse, ranked)
+ *   - EntityCard       — what `get_agent` returns (full, signed)
+ *
+ * MCP tool results stringify these via format.ts.
+ */
+export type SearchResultRow = AgentSearchResponse;
+
+/** What `call_agent` returns to the MCP client. */
+export interface CallAgentResult {
+  response: string;
+  entityId: string;
+  agentName: string;
+  messageId: string;
+  conversationId: string;
+  payment: PaymentInfo;
+  /** True if the response was signed and the signature verified, false if unsigned, null if not checked. */
+  signatureVerified: boolean | null;
 }
 
-export type AgentStatus = "ACTIVE" | "INACTIVE" | "DEPRECATED";
-
-export interface AgentListResponse {
-  data: Agent[];
-  count: number;
-  total: number;
-}
-
-export interface AgentDetailResponse {
-  agent: Agent;
-  credentials: unknown;
-}
-
-export interface AgentMessage {
-  content: string;
-  prompt: string;
-  sender_id: string;
-  receiver_id: string;
-  message_type: string;
-  message_id: string;
-  conversation_id: string;
-  in_reply_to: string | null;
-  metadata: Record<string, unknown>;
-  timestamp: number;
-}
-
-export interface WebhookSyncResponse {
-  status?: string;
-  response?: string;
-  output?: string;
-  [key: string]: unknown;
-}
-
+/** Payment metadata extracted from x402 settlement headers on a successful call. */
 export interface PaymentInfo {
   paid: boolean;
   transaction: string | null;
   network: string | null;
   payer: string | null;
+}
+
+/** What an AgentDNS-compliant agent's /webhook/sync response body looks like on the wire. */
+export interface WebhookSyncResponse {
+  status?: string;
+  message_id?: string;
+  response?: string;
+  /** Some legacy agents emitted `output` instead of `response` — accept both for compat. */
+  output?: string;
+  /** Optional Ed25519 signature over the response body (when the agent signs replies). */
+  signature?: string;
+  /** Public key the response was signed with — present only when `signature` is present. */
+  signed_by?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Internal: a hydrated card for use by tools. We attach the entity_url that
+ * resolved the card so call_agent doesn't need to re-derive it.
+ */
+export interface HydratedCard {
+  card: EntityCard;
+  entityUrl: string;
 }
