@@ -1,35 +1,36 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SearchAgentsSchema, type SearchAgentsInput } from "../schemas/tools.js";
-import { searchAgents } from "../services/registry-client.js";
-import { formatAgentList } from "../services/format.js";
+import {
+  SearchAgentsSchema,
+  type SearchAgentsInput,
+} from "../schemas/tools.js";
+import { searchEntities } from "../services/registry-client.js";
+import { formatSearchResults } from "../services/format.js";
 import { handleToolError } from "./error-handler.js";
+import type { SearchRequest } from "zyndai";
 
 export function registerSearchAgents(server: McpServer): void {
   server.registerTool(
     "zyndai_search_agents",
     {
-      title: "Search ZyndAI Agents",
-      description: `Search the ZyndAI agent network for agents by keyword, description, or capabilities.
+      title: "Search AgentDNS",
+      description: `Search the AgentDNS network for agents and services.
 
-Uses hybrid search (vector similarity + keyword matching) to find the most relevant agents.
+Hits the registry's hybrid search (semantic + keyword) at POST /v1/search.
+Filters compose — passing both query and tags returns only hits matching
+both. Omit \`query\` and pass only filters to browse the network.
 
-Args:
-  - query (string): Natural language search query (e.g., "stock analysis", "weather")
-  - capabilities (string[], optional): Filter by capability tags (e.g., ["nlp", "financial"])
-  - limit (number, optional): Max results 1-100 (default: 10)
-
-Returns:
-  List of matching agents with their ID, name, description, capabilities, and whether they are callable (have a webhook URL). Use the agent ID with zyndai_call_agent to send messages.
+Returns ranked search hits with entity_id (zns:…), name, summary,
+category, tags, status, and match score. Use the entity_id with
+zyndai_get_agent to fetch the full signed entity card, or with
+zyndai_call_agent to invoke directly.
 
 Examples:
-  - "Find agents that analyze stocks" -> query: "stock analysis"
-  - "Find NLP agents" -> query: "nlp", capabilities: ["nlp"]
-  - "Weather forecast agents" -> query: "weather forecast"
-
-Error Handling:
-  - Returns "No agents found" if search returns empty — try broader terms
-  - Returns error with status code if registry is unreachable`,
-      inputSchema: SearchAgentsSchema,
+  - "Find agents that analyze stocks"      -> { query: "stock analysis" }
+  - "List all finance agents"              -> { category: "finance" }
+  - "Find LangChain agents in Spanish"     -> { tags: ["langchain"], languages: ["es"] }
+  - "Browse with full cards"               -> { enrich: true }
+  - "Federated search across registries"   -> { query: "translation", federated: true }`,
+      inputSchema: SearchAgentsSchema.shape,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -39,17 +40,31 @@ Error Handling:
     },
     async (params: SearchAgentsInput) => {
       try {
-        const result = await searchAgents(
-          params.query,
-          params.capabilities,
-          params.limit,
-        );
-
+        const req: SearchRequest = {
+          query: params.query,
+          category: params.category,
+          tags: params.tags,
+          skills: params.skills,
+          protocols: params.protocols,
+          languages: params.languages,
+          models: params.models,
+          min_trust_score: params.min_trust_score,
+          status: params.status,
+          federated: params.federated,
+          enrich: params.enrich,
+          max_results: params.max_results,
+          offset: params.offset,
+        };
+        const result = await searchEntities(req);
         return {
           content: [
             {
               type: "text" as const,
-              text: formatAgentList(result.data, result.total, 0),
+              text: formatSearchResults(
+                result.results,
+                result.total_found,
+                params.offset ?? 0,
+              ),
             },
           ],
         };
