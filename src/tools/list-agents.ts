@@ -1,35 +1,36 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ListAgentsSchema, type ListAgentsInput } from "../schemas/tools.js";
-import { listAgents } from "../services/registry-client.js";
-import { formatAgentList } from "../services/format.js";
+import {
+  ListAgentsSchema,
+  type ListAgentsInput,
+} from "../schemas/tools.js";
+import { searchEntities } from "../services/registry-client.js";
+import { formatSearchResults } from "../services/format.js";
 import { handleToolError } from "./error-handler.js";
 
 export function registerListAgents(server: McpServer): void {
   server.registerTool(
     "zyndai_list_agents",
     {
-      title: "List ZyndAI Agents",
-      description: `Browse all agents registered on the ZyndAI network with pagination.
+      title: "List AgentDNS Entities",
+      description: `Browse all agents and services on AgentDNS with pagination.
 
-Unlike search, this returns all agents without keyword matching — useful for browsing the network or getting an overview of available agents.
+Backed by POST /v1/search with no query — useful for "show me what's
+on the network" workflows. For targeted discovery, prefer
+zyndai_search_agents.
 
 Args:
-  - status (string, optional): Filter by status — "ACTIVE" (default), "INACTIVE", or "DEPRECATED"
-  - limit (number, optional): Max results 1-100 (default: 20)
-  - offset (number, optional): Skip N results for pagination (default: 0)
-
-Returns:
-  Paginated list of agents with their ID, name, description, capabilities, and callable status. Includes total count and pagination guidance.
+  - category (string, optional)
+  - tags (string[], optional)
+  - federated (bool, optional) — query the federation, not just dns01
+  - max_results (1-100, default 20)
+  - offset (default 0)
 
 Examples:
-  - Browse all active agents: (no params needed)
-  - See next page: offset: 20
-  - Find deprecated agents: status: "DEPRECATED"
-
-Error Handling:
-  - Returns empty list if no agents match the status filter
-  - Returns error if registry is unreachable`,
-      inputSchema: ListAgentsSchema,
+  - "Browse the network"                  -> {}
+  - "Show finance agents"                 -> { category: "finance" }
+  - "Next page"                           -> { offset: 20 }
+  - "Browse the whole federation"         -> { federated: true }`,
+      inputSchema: ListAgentsSchema.shape,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -39,20 +40,21 @@ Error Handling:
     },
     async (params: ListAgentsInput) => {
       try {
-        const result = await listAgents(
-          params.status,
-          params.limit,
-          params.offset,
-        );
-
+        const result = await searchEntities({
+          category: params.category,
+          tags: params.tags,
+          federated: params.federated,
+          max_results: params.max_results,
+          offset: params.offset,
+        });
         return {
           content: [
             {
               type: "text" as const,
-              text: formatAgentList(
-                result.data,
-                result.total,
-                params.offset,
+              text: formatSearchResults(
+                result.results,
+                result.total_found,
+                params.offset ?? 0,
               ),
             },
           ],
