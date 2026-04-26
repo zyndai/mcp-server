@@ -1,8 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { DEFAULT_REGISTRY_URL } from "../constants.js";
 import { readActivePersona } from "../services/identity-store.js";
-import { fetchPendingRequests } from "../services/persona-inbox.js";
+import { existingDaemon } from "../services/persona-daemon.js";
+import { readPending } from "../services/mailbox.js";
 import { handleToolError } from "./error-handler.js";
 
 const PendingRequestsSchema = z
@@ -11,7 +11,7 @@ const PendingRequestsSchema = z
       .string()
       .optional()
       .describe(
-        "Only return requests queued after this ISO 8601 timestamp. Useful for polling — pass the timestamp from the previous call to fetch only new messages.",
+        "Only return requests received after this ISO 8601 timestamp. Useful for polling — pass the timestamp from the previous call to fetch only new messages.",
       ),
   })
   .strict();
@@ -23,32 +23,23 @@ export function registerPendingRequestsTool(server: McpServer): void {
     "zyndai_pending_requests",
     {
       title: "Fetch incoming messages for the persona",
-      description: `List messages other agents have sent to the user's Claude persona.
+      description: `List messages other agents have sent to the user's Claude persona that are still awaiting a human reply.
 
-Other agents on AgentDNS can call into the persona's entity_url. Since the MCP doesn't host a webhook directly, the registry queues the messages in an inbox. This tool fetches that inbox.
+The persona-runner (started by zyndai_register_persona) records every inbound /webhook hit to ~/.zynd/mailbox/<entity_id>.jsonl. This tool reads that file and returns only entries with status=pending.
 
-Workflow when an incoming request arrives:
-  1. Call zyndai_pending_requests to fetch the queue.
-  2. For each request, ask the user: "Agent X is asking '<content>'. Do you want to reply?"
-  3. Use zyndai_respond_to_request to either send an approved reply or reject the request.
-
-Returned fields per request:
-  - message_id (string) — pass back to zyndai_respond_to_request
-  - sender_id (zns:...) — who's calling
-  - sender_name (optional) — friendly name from sender's card
-  - content (string) — the actual message
-  - conversation_id (optional)
-  - queued_at — when the registry received it
-  - metadata (optional) — any extra context the sender attached
+Workflow when a request lands:
+  1. Call zyndai_pending_requests.
+  2. For each entry, ask the user: "Agent X is asking '<content>'. Do you want to reply?"
+  3. Call zyndai_respond_to_request to send an approved reply or reject.
 
 Args:
-  - since (string, optional) — ISO timestamp; only return newer requests.`,
+  - since (string, optional) — ISO timestamp; only return newer entries.`,
       inputSchema: PendingRequestsSchema.shape,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: false,
-        openWorldHint: true,
+        openWorldHint: false,
       },
     },
     async (params: PendingRequestsInput) => {
@@ -60,72 +51,61 @@ Args:
             content: [
               {
                 type: "text" as const,
-                text:
-                  "Error: No active persona. Run `zyndai_login` and `zyndai_register_persona` first — until you have a persona, no one can address messages to you.",
+                text: "Error: No active persona. Run `zyndai_login` then `zyndai_register_persona` first.",
               },
             ],
           };
         }
 
-        const registryUrl =
-          process.env["ZYNDAI_REGISTRY_URL"] ?? DEFAULT_REGISTRY_URL;
-        const result = await fetchPendingRequests({
-          registryUrl,
-          entityId: persona.entity_id,
-          since: params.since,
-        });
+        const daemon = existingDaemon();
+        const daemonNote = daemon
+          ? ""
+          : `\n\n_Note: persona-runner is not currently running. Inbound messages won't be received until you re-register or restart the runner. (See \`~/.zynd/persona-runner.log\` for crash details.)_`;
 
-        if (result.unsupported) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text:
-                  `Inbox routing isn't deployed on this AgentDNS registry yet (\`GET /v1/inbox/${persona.entity_id}\` returned 404). ` +
-                  `Other agents can still see your persona on the registry, but their messages won't reach the MCP until inbox support ships. ` +
-                  `Track the registry's release notes for "/v1/inbox" availability.`,
-              },
-            ],
-          };
+        let entries = readPending(persona.entity_id);
+        if (params.since) {
+          const cutoff = Date.parse(params.since);
+          if (!Number.isNaN(cutoff)) {
+            entries = entries.filter((e) => Date.parse(e.received_at) > cutoff);
+          }
         }
 
-        if (result.requests.length === 0) {
+        if (entries.length === 0) {
           return {
             content: [
               {
                 type: "text" as const,
                 text:
-                  `No pending requests for **${persona.agent_name}** \`${persona.entity_id}\`.\n\n` +
-                  `Other agents on AgentDNS can reach this persona by sending an AgentMessage to its entity_url. ` +
-                  `Call this tool again later to check.`,
+                  `No pending requests for **${persona.agent_name}** \`${persona.entity_id}\`.${daemonNote}`,
               },
             ],
           };
         }
 
         const lines = [
-          `**${result.requests.length} pending request${result.requests.length === 1 ? "" : "s"}** for ${persona.agent_name}:`,
+          `**${entries.length} pending request${entries.length === 1 ? "" : "s"}** for ${persona.agent_name}:`,
           "",
         ];
-        for (const req of result.requests) {
-          lines.push(`---`);
-          lines.push(`Message ID: \`${req.message_id}\``);
-          lines.push(`From: \`${req.sender_id}\`${req.sender_name ? ` (${req.sender_name})` : ""}`);
-          lines.push(`Queued at: ${req.queued_at}`);
-          if (req.conversation_id) {
-            lines.push(`Conversation: \`${req.conversation_id}\``);
-          }
-          if (req.metadata && Object.keys(req.metadata).length > 0) {
-            lines.push(`Metadata: ${JSON.stringify(req.metadata)}`);
+        for (const e of entries) {
+          lines.push("---");
+          lines.push(`Message ID: \`${e.message_id}\``);
+          lines.push(
+            `From: \`${e.sender_id}\`${e.sender_name ? ` (${e.sender_name})` : ""}`,
+          );
+          lines.push(`Received: ${e.received_at}`);
+          if (e.conversation_id) lines.push(`Conversation: \`${e.conversation_id}\``);
+          if (e.metadata && Object.keys(e.metadata).length > 0) {
+            lines.push(`Metadata: ${JSON.stringify(e.metadata)}`);
           }
           lines.push("");
-          lines.push(`> ${req.content.replace(/\n/g, "\n> ")}`);
+          lines.push(`> ${e.content.replace(/\n/g, "\n> ")}`);
           lines.push("");
         }
         lines.push(
-          `For each request, ask the user whether to approve, then call ` +
+          `For each request, confirm with the user, then call ` +
             `\`zyndai_respond_to_request({ message_id, approve, response })\`.`,
         );
+        if (daemonNote) lines.push(daemonNote);
 
         return {
           content: [{ type: "text" as const, text: lines.join("\n") }],

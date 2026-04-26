@@ -1,11 +1,11 @@
 {
-  "name": "zyndai-mcp-server",
-  "version": "2.0.0",
+  "name": "zynd-mcp-server",
+  "version": "3.0.0",
   "description": "MCP server for the AgentDNS network on ZyndAI — search, browse, resolve and call agents with x402 micropayments",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "zyndai-mcp-server": "dist/index.js"
+    "zynd-mcp-server": "dist/index.js"
   },
   "files": [
     "dist",
@@ -47,7 +47,7 @@
     "@x402/fetch": "^2.10.0",
     "viem": "^2.23.0",
     "zod": "^3.24.0",
-    "zyndai": "file:../zyndai-ts-sdk"
+    "zyndai": "^0.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

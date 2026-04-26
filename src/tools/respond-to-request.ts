@@ -1,40 +1,26 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { DEFAULT_REGISTRY_URL } from "../constants.js";
-import { loadActivePersonaKeypair } from "../services/identity-store.js";
-import { postReply } from "../services/persona-inbox.js";
+import { readActivePersona } from "../services/identity-store.js";
+import { existingDaemon, postInternalReply } from "../services/persona-daemon.js";
+import { findEntry, updateStatus } from "../services/mailbox.js";
 import { handleToolError } from "./error-handler.js";
 
-// Cross-field validation (response required when approve=true) lives in the
-// handler, not the schema — the MCP SDK's registerTool() wants a raw
-// ZodRawShape on inputSchema, and chaining .refine() wraps the schema in
-// ZodEffects which loses the `.shape` accessor.
 const RespondToRequestSchema = z
   .object({
     message_id: z
       .string()
       .min(1)
-      .describe(
-        "ID of the request to reply to. Get this from zyndai_pending_requests.",
-      ),
+      .describe("ID of the request to reply to. Get this from zyndai_pending_requests."),
     approve: z
       .boolean()
       .describe(
-        "true = the user approved the request and Claude has a reply to send. false = the user explicitly rejected — the sender will be notified the persona declined to respond.",
+        "true = the user approved and Claude has a reply to send. false = user explicitly rejected.",
       ),
     response: z
       .string()
       .max(10_000)
       .optional()
-      .describe(
-        "The reply text. Required when approve=true. Ignored when approve=false.",
-      ),
-    conversation_id: z
-      .string()
-      .optional()
-      .describe(
-        "Pass through the conversation_id from the incoming request to keep context across turns.",
-      ),
+      .describe("The reply text. Required when approve=true. Ignored when approve=false."),
   })
   .strict();
 
@@ -51,20 +37,20 @@ Always confirm with the user before calling this:
   "Agent X is asking '<request>'. Do you want to reply, and if so, what?"
 
 When you have the user's decision:
-  - Approval + a reply: zyndai_respond_to_request({ message_id, approve: true, response: "..." })
+  - Approval: zyndai_respond_to_request({ message_id, approve: true, response: "..." })
   - Rejection: zyndai_respond_to_request({ message_id, approve: false })
 
-The reply is signed with the active persona's Ed25519 keypair so the sender can verify it really came from this persona.
+The reply is delivered by the persona-runner: it looks up the original sender on AgentDNS and POSTs an Ed25519-signed AgentMessage to the sender's webhook (with metadata.in_reply_to set so they can correlate it back to the original request).
 
 Args:
   - message_id (string, required) — from zyndai_pending_requests.
   - approve (bool, required) — true = send response, false = reject.
   - response (string) — required when approve=true.
-  - conversation_id (string, optional) — for multi-turn continuity.
 
 Errors:
   - "no active persona" — run zyndai_login + zyndai_register_persona first.
-  - "inbox routing not deployed" — registry hasn't shipped /v1/inbox yet.`,
+  - "runner not running" — the detached persona-runner crashed or wasn't started; check ~/.zynd/persona-runner.log.
+  - "no such message" — message_id not in mailbox (already replied or wrong id).`,
       inputSchema: RespondToRequestSchema.shape,
       annotations: {
         readOnlyHint: false,
@@ -81,64 +67,94 @@ Errors:
             content: [
               {
                 type: "text" as const,
-                text:
-                  "Error: `response` is required when `approve` is true. Either set `approve: false` to reject, or pass a reply body in `response`.",
+                text: "Error: `response` is required when `approve` is true.",
               },
             ],
           };
         }
 
-        const loaded = loadActivePersonaKeypair();
-        if (!loaded) {
+        const persona = readActivePersona();
+        if (!persona) {
+          return {
+            isError: true as const,
+            content: [
+              {
+                type: "text" as const,
+                text: "Error: No active persona. Run `zyndai_login` and `zyndai_register_persona` first.",
+              },
+            ],
+          };
+        }
+
+        const entry = findEntry(persona.entity_id, params.message_id);
+        if (!entry) {
+          return {
+            isError: true as const,
+            content: [
+              {
+                type: "text" as const,
+                text: `Error: no message \`${params.message_id}\` in mailbox. Use \`zyndai_pending_requests\` to see current ids.`,
+              },
+            ],
+          };
+        }
+        if (entry.status !== "pending") {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Message \`${params.message_id}\` is already \`${entry.status}\` — no further action needed.`,
+              },
+            ],
+          };
+        }
+
+        const handle = existingDaemon();
+        if (!handle) {
+          // Daemon not running — at least mark the mailbox so the user
+          // can see they declined. Outbound delivery requires the runner.
+          if (!params.approve) {
+            updateStatus(persona.entity_id, params.message_id, { status: "rejected" });
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Marked \`${params.message_id}\` as rejected locally. (Runner not running, so the sender was NOT notified — they'll retry until they give up or until you re-register the persona.)`,
+                },
+              ],
+            };
+          }
           return {
             isError: true as const,
             content: [
               {
                 type: "text" as const,
                 text:
-                  "Error: No active persona. Run `zyndai_login` and `zyndai_register_persona` first — there's no signing identity to reply with.",
+                  "Error: persona-runner is not running, so we can't deliver the reply outbound. Check `~/.zynd/persona-runner.log`, or call `zyndai_deregister_persona` and re-register to restart it.",
               },
             ],
           };
         }
 
-        const registryUrl =
-          process.env["ZYNDAI_REGISTRY_URL"] ?? DEFAULT_REGISTRY_URL;
-        const result = await postReply({
-          registryUrl,
-          entityId: loaded.persona.entity_id,
-          messageId: params.message_id,
-          personaKeypair: loaded.keypair,
+        const result = await postInternalReply(handle, {
+          message_id: params.message_id,
+          response: params.response ?? "",
           approve: params.approve,
-          response: params.response,
-          conversationId: params.conversation_id,
         });
 
-        if (result.status === "unsupported") {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text:
-                  "Inbox routing isn't deployed on this AgentDNS registry yet (`POST /v1/inbox/.../reply` returned 404). The reply was not delivered.",
-              },
-            ],
-          };
-        }
-
         const verb = result.status === "delivered" ? "Reply delivered" : "Request rejected";
-        const lines = [
-          `**${verb}.**`,
-          "",
-          `- Message ID: \`${params.message_id}\``,
-          `- From persona: \`${loaded.persona.agent_name}\` \`${loaded.persona.entity_id}\``,
-        ];
-        if (result.signature) {
-          lines.push(
-            `- Signature: \`${result.signature.slice(0, 32)}…\` (Ed25519, sender can verify against the persona's registered public key)`,
-          );
-        }
-        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `**${verb}.**\n\n` +
+                `- Message ID: \`${params.message_id}\`\n` +
+                `- From persona: \`${persona.agent_name}\` \`${persona.entity_id}\`\n` +
+                `- Sent to sender: \`${entry.sender_id}\``,
+            },
+          ],
+        };
       } catch (error) {
         return handleToolError(error);
       }

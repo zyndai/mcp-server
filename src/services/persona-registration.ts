@@ -46,6 +46,12 @@ export interface RegisterPersonaOpts {
     amount_usd: number;
     currency?: string;
   };
+  /**
+   * Public URL the persona will be reachable at. Required since v3 — the
+   * persona-runner daemon hosts a real webhook on this URL, so registry
+   * callers can route inbound messages here instead of a placeholder.
+   */
+  entityUrl: string;
 }
 
 export interface RegisterPersonaResult {
@@ -78,10 +84,7 @@ export async function registerPersona(
   );
   const developerId = generateDeveloperId(opts.developerKeypair.publicKeyBytes);
 
-  // Placeholder entity_url. Personas don't host webhooks — they're
-  // signing identities. Other agents that try to call this URL will
-  // 404, which is the expected behavior.
-  const entityUrl = `https://zynd.ai/personas/${personaKp.entityId}`;
+  const entityUrl = opts.entityUrl;
 
   const summary =
     opts.summary ??

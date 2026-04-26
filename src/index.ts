@@ -41,27 +41,51 @@ if (process.env["ZYNDAI_API_KEY"]) {
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
+// Identity / persona lifecycle — must come before discovery tools so a
+// brand-new user is naturally guided through login → register before
+// calling other agents.
+import { registerLoginTool } from "./tools/login.js";
+import { registerRegisterPersonaTool } from "./tools/register-persona.js";
+import { registerDeregisterPersonaTool } from "./tools/deregister-persona.js";
+import { registerWhoamiTool } from "./tools/whoami.js";
+
+// Discovery / call tools.
 import { registerSearchAgents } from "./tools/search-agents.js";
 import { registerListAgents } from "./tools/list-agents.js";
 import { registerGetAgent } from "./tools/get-agent.js";
 import { registerResolveFqan } from "./tools/resolve-fqan.js";
 import { registerCallAgent } from "./tools/call-agent.js";
 
+// Inbox — incoming messages other agents send to this persona.
+import { registerPendingRequestsTool } from "./tools/pending-requests.js";
+import { registerRespondToRequestTool } from "./tools/respond-to-request.js";
+
 const server = new McpServer({
   name: "zyndai-mcp-server",
-  version: "2.0.0",
+  version: "3.0.0",
 });
 
+// Identity
+registerLoginTool(server);
+registerRegisterPersonaTool(server);
+registerDeregisterPersonaTool(server);
+registerWhoamiTool(server);
+
+// Discovery + invocation
 registerSearchAgents(server);
 registerListAgents(server);
 registerGetAgent(server);
 registerResolveFqan(server);
 registerCallAgent(server);
 
+// Inbox
+registerPendingRequestsTool(server);
+registerRespondToRequestTool(server);
+
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("zyndai-mcp-server 2.0.0 (AgentDNS) running on stdio");
+  console.error("zyndai-mcp-server 3.0.0 (AgentDNS, live persona-runner) running on stdio");
 }
 
 main().catch((error: unknown) => {
