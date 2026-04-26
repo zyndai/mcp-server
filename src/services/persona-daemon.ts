@@ -224,3 +224,14 @@ export async function postInternalReply(
 export function isMac(): boolean {
   return os.platform() === "darwin";
 }
+
+/**
+ * Stop a running daemon and spawn a fresh one with new opts. Reuses the
+ * same webhook + internal ports unless overridden so the entity_url
+ * recorded on the registry stays valid.
+ */
+export function restartDaemon(opts: SpawnOpts): DaemonHandle {
+  const existing = readHandle();
+  if (existing) killDaemon(existing);
+  return spawnDaemon(opts);
+}

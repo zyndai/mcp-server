@@ -153,7 +153,24 @@ Errors:
               }
             : undefined;
 
-        const webhookPort = await pickFreePort(5050);
+        // If the user has fixed the upstream port for their tunnel
+        // (ngrok/cloudflared/etc.), honor it. Otherwise pick any free port
+        // starting from 5050.
+        const pinnedPort = process.env["ZYNDAI_PERSONA_WEBHOOK_PORT"];
+        const webhookPort = pinnedPort
+          ? Number.parseInt(pinnedPort, 10)
+          : await pickFreePort(5050);
+        if (Number.isNaN(webhookPort) || webhookPort <= 0 || webhookPort > 65535) {
+          return {
+            isError: true as const,
+            content: [
+              {
+                type: "text" as const,
+                text: `Error: ZYNDAI_PERSONA_WEBHOOK_PORT must be a valid port number (1..65535), got '${pinnedPort}'.`,
+              },
+            ],
+          };
+        }
         const internalPort = await pickFreePort(webhookPort + 1);
 
         const result = await registerPersona({

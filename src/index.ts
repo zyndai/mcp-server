@@ -46,6 +46,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 // calling other agents.
 import { registerLoginTool } from "./tools/login.js";
 import { registerRegisterPersonaTool } from "./tools/register-persona.js";
+import { registerUpdatePersonaTool } from "./tools/update-persona.js";
 import { registerDeregisterPersonaTool } from "./tools/deregister-persona.js";
 import { registerWhoamiTool } from "./tools/whoami.js";
 
@@ -68,6 +69,7 @@ const server = new McpServer({
 // Identity
 registerLoginTool(server);
 registerRegisterPersonaTool(server);
+registerUpdatePersonaTool(server);
 registerDeregisterPersonaTool(server);
 registerWhoamiTool(server);
 
