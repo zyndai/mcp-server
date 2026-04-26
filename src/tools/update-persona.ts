@@ -55,9 +55,11 @@ export function registerUpdatePersonaTool(server: McpServer): void {
     {
       title: "Update the persona's registry record (and restart runner if needed)",
       description: `Patch the active persona's AgentDNS record without changing its entity_id. Use when:
-  - The ngrok / cloudflared / tunnel URL rotated → pass entity_url=<new-https-url>.
+  - The ngrok / cloudflared / tunnel URL rotated → pass entity_url=<new-https-url>, OR call this tool with no args after updating ZYNDAI_PERSONA_PUBLIC_URL in the MCP host env.
   - The user wants to start charging (or stop) → pass pricing_usd.
   - The persona's summary or tags need refreshing.
+
+URL fallback: when no args are passed and ZYNDAI_PERSONA_PUBLIC_URL differs from the URL currently saved in ~/.zynd/mcp-persona.json, the tool patches entity_url to that env value automatically. This is the "I just edited my Claude Desktop config" path.
 
 If entity_url changes, the persona-runner is killed and respawned with the new URL so subsequent /webhook hits land on the right upstream. The old PID is replaced in ~/.zynd/mcp-persona.json.
 
@@ -94,8 +96,19 @@ Errors:
           };
         }
 
+        // Resolve effective entity_url: explicit arg wins, then env fallback
+        // when the env URL differs from the URL we last spawned the runner with.
+        const currentDaemon = existingDaemon();
+        const envUrl = process.env["ZYNDAI_PERSONA_PUBLIC_URL"];
+        let effectiveEntityUrl = params.entity_url;
+        if (!effectiveEntityUrl && envUrl && /^https?:\/\//i.test(envUrl)) {
+          if (!currentDaemon || currentDaemon.entity_url !== envUrl) {
+            effectiveEntityUrl = envUrl;
+          }
+        }
+
         const fields: Record<string, unknown> = {};
-        if (params.entity_url !== undefined) fields["entity_url"] = params.entity_url;
+        if (effectiveEntityUrl !== undefined) fields["entity_url"] = effectiveEntityUrl;
         if (params.summary !== undefined) fields["summary"] = params.summary;
         if (params.tags !== undefined) {
           // Merge with defaults so the persona is still discoverable by
@@ -119,9 +132,15 @@ Errors:
 
         if (Object.keys(fields).length === 0) {
           return {
-            isError: true as const,
             content: [
-              { type: "text" as const, text: "Error: nothing to update — pass at least one of entity_url, summary, tags, pricing_usd." },
+              {
+                type: "text" as const,
+                text:
+                  `No changes detected. ` +
+                  (envUrl
+                    ? `ZYNDAI_PERSONA_PUBLIC_URL (${envUrl}) already matches the current registered URL.`
+                    : `ZYNDAI_PERSONA_PUBLIC_URL is not set. Pass at least one of entity_url, summary, tags, pricing_usd.`),
+              },
             ],
           };
         }
@@ -145,20 +164,19 @@ Errors:
         // is bound to a local port, but the entity_url it advertises in
         // .well-known/agent.json comes from the daemon config we hand it.
         // Restart with the new URL so the served card matches reality.
-        if (params.entity_url) {
-          const current = existingDaemon();
-          if (current) {
+        if (effectiveEntityUrl) {
+          if (currentDaemon) {
             const fresh = restartDaemon({
               entityId: loaded.persona.entity_id,
               agentName: loaded.persona.agent_name,
               keypairPath: loaded.persona.keypair_path,
               registryUrl,
-              entityUrl: params.entity_url,
-              webhookPort: current.webhook_port,
-              internalPort: current.internal_port,
+              entityUrl: effectiveEntityUrl,
+              webhookPort: currentDaemon.webhook_port,
+              internalPort: currentDaemon.internal_port,
             });
             lines.push(``);
-            lines.push(`Runner restarted: PID ${current.pid} → ${fresh.pid}, now serving \`${params.entity_url}\` upstream.`);
+            lines.push(`Runner restarted: PID ${currentDaemon.pid} → ${fresh.pid}, now serving \`${effectiveEntityUrl}\` upstream.`);
           } else {
             lines.push(``);
             lines.push(`_Note: runner is not currently running — call \`zyndai_deregister_persona\` then \`zyndai_register_persona\` to start it again._`);
