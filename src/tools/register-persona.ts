@@ -57,20 +57,23 @@ export function registerRegisterPersonaTool(server: McpServer): void {
     "zyndai_register_persona",
     {
       title: "Register Claude persona on AgentDNS (one-time)",
-      description: `Register the user's Claude persona on AgentDNS AND start a detached background webhook so other agents can actually reach them.
+      description: `Register the user's Claude persona on AgentDNS AND start a detached background A2A server so other agents can actually reach them.
 
 This is a ONE-TIME action per user. If a persona is already registered (i.e. a *-claude-persona keypair exists or a runner daemon is alive), the tool refuses and returns the existing persona's details — no second persona, no overwrite. To replace, the user must call zyndai_deregister_persona first.
 
 What happens on success:
   1. Derives an Ed25519 persona keypair from the developer key (~/.zynd/agents/agent-N.json).
   2. Registers it on AgentDNS as <name>-claude-persona, tagged 'claude-persona', 'mcp-client', 'human-in-the-loop'.
-  3. Spawns a detached persona-runner process that hosts a real webhook on $ZYNDAI_PERSONA_PUBLIC_URL — survives Claude Desktop being closed.
+  3. Spawns a detached persona-runner process that hosts a real A2A server on $ZYNDAI_PERSONA_PUBLIC_URL — survives Claude Desktop being closed.
   4. On macOS, installs ~/Library/LaunchAgents/ai.zynd.persona.plist so the runner auto-starts on login and respawns on crash.
 
-After registration, callers reach the persona at <ZYNDAI_PERSONA_PUBLIC_URL>/webhook. Inbound messages land in ~/.zynd/mailbox/<entity_id>.jsonl. Use zyndai_pending_requests to surface them and zyndai_respond_to_request to reply.
+After registration, callers reach the persona at <ZYNDAI_PERSONA_PUBLIC_URL>/a2a/v1 (signed JSON-RPC, x-zynd-auth verified). Inbound messages land in ~/.zynd/mailbox/<entity_id>.jsonl. Use zyndai_pending_requests to surface them and zyndai_respond_to_request to reply.
 
 Required env (set in the MCP host config):
-  ZYNDAI_PERSONA_PUBLIC_URL — the public URL the runner is reachable at. Set this BEFORE registering. Use a tunnel (ngrok/cloudflared) or a stable cloud URL pointing back to the runner's webhook port.
+  ZYNDAI_PERSONA_PUBLIC_URL — the public base URL (no path) the runner is reachable at. Set this BEFORE registering. Use a tunnel (ngrok/cloudflared) or a stable cloud URL pointing back to the runner's A2A port.
+
+Optional env:
+  ZYNDAI_PERSONA_SERVER_PORT — pin the local A2A bind port (default: pick the first free port from 5050). Legacy ZYNDAI_PERSONA_WEBHOOK_PORT is still honored for back-compat.
 
 Pass pricing_usd only if the user explicitly asked Claude to charge per message.
 
@@ -135,7 +138,7 @@ Errors:
               {
                 type: "text" as const,
                 text:
-                  "Error: ZYNDAI_PERSONA_PUBLIC_URL is not set. The persona-runner needs a public URL (e.g. an ngrok or cloudflared tunnel pointing at the local webhook port) before it can register on AgentDNS. Set it in the MCP host config and try again.",
+                  "Error: ZYNDAI_PERSONA_PUBLIC_URL is not set. The persona-runner needs a public base URL (e.g. an ngrok or cloudflared tunnel pointing at the local A2A port) before it can register on AgentDNS. Set it in the MCP host config and try again.",
               },
             ],
           };
@@ -156,22 +159,27 @@ Errors:
         // If the user has fixed the upstream port for their tunnel
         // (ngrok/cloudflared/etc.), honor it. Otherwise pick any free port
         // starting from 5050.
-        const pinnedPort = process.env["ZYNDAI_PERSONA_WEBHOOK_PORT"];
-        const webhookPort = pinnedPort
+        //
+        // ZYNDAI_PERSONA_SERVER_PORT is the post-A2A name; the legacy
+        // ZYNDAI_PERSONA_WEBHOOK_PORT is still accepted for back-compat.
+        const pinnedPort =
+          process.env["ZYNDAI_PERSONA_SERVER_PORT"] ??
+          process.env["ZYNDAI_PERSONA_WEBHOOK_PORT"];
+        const serverPort = pinnedPort
           ? Number.parseInt(pinnedPort, 10)
           : await pickFreePort(5050);
-        if (Number.isNaN(webhookPort) || webhookPort <= 0 || webhookPort > 65535) {
+        if (Number.isNaN(serverPort) || serverPort <= 0 || serverPort > 65535) {
           return {
             isError: true as const,
             content: [
               {
                 type: "text" as const,
-                text: `Error: ZYNDAI_PERSONA_WEBHOOK_PORT must be a valid port number (1..65535), got '${pinnedPort}'.`,
+                text: `Error: ZYNDAI_PERSONA_SERVER_PORT must be a valid port number (1..65535), got '${pinnedPort}'.`,
               },
             ],
           };
         }
-        const internalPort = await pickFreePort(webhookPort + 1);
+        const internalPort = await pickFreePort(serverPort + 1);
 
         const result = await registerPersona({
           developerKeypair,
@@ -183,14 +191,14 @@ Errors:
         });
 
         // Now spin up the detached runner so callers can actually reach the
-        // webhook URL we just registered.
+        // A2A endpoint URL we just registered.
         const handle = spawnDaemon({
           entityId: result.entityId,
           agentName: result.agentName,
           keypairPath: result.keypairPath,
           registryUrl,
           entityUrl: publicUrl,
-          webhookPort,
+          serverPort,
           internalPort,
           pricing: pricing
             ? { amount_usd: pricing.amount_usd, currency: pricing.currency ?? "USDC" }
@@ -236,13 +244,13 @@ Errors:
                 `- Entity ID: \`${result.entityId}\`\n` +
                 `- Public key: \`${result.publicKey}\`\n` +
                 `- Public URL: ${publicUrl}\n` +
-                `- Local webhook port: ${webhookPort}\n` +
+                `- Local A2A port: ${serverPort}\n` +
                 `- Internal reply port: ${internalPort} (loopback only)\n` +
                 `- Runner PID: ${handle.pid}\n` +
                 `- Keypair: \`${result.keypairPath}\`\n` +
                 `${launchdNote}` +
                 `${pricingLine}\n\n` +
-                `Other agents can now reach you at ${publicUrl}/webhook. Use \`zyndai_pending_requests\` to fetch incoming messages and \`zyndai_respond_to_request\` to reply (after asking the user). Logs at \`~/.zynd/persona-runner.log\`.`,
+                `Other agents can now reach you at ${publicUrl}/a2a/v1. Use \`zyndai_pending_requests\` to fetch incoming messages and \`zyndai_respond_to_request\` to reply (after asking the user). Logs at \`~/.zynd/persona-runner.log\`.`,
             },
           ],
         };

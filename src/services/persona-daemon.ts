@@ -1,6 +1,6 @@
 /**
  * Persona daemon — spawn / status / kill helper for the detached
- * persona-runner process.
+ * persona-runner process (post-A2A).
  *
  * The MCP server doesn't host the persona itself (its lifetime is bound to
  * the Claude host), so register-persona spawns persona-runner.js as a
@@ -11,15 +11,19 @@
  *     "pid": 12345,
  *     "started_at": "2026-04-26T...",
  *     "config_path": "~/.zynd/mcp-persona-config.json",
- *     "webhook_port": 5050,
+ *     "server_port": 5050,
  *     "internal_port": 5051,
  *     "entity_url": "https://...",
- *     "registry_url": "https://dns01.zynd.ai"
+ *     "registry_url": "https://zns01.zynd.ai"
  *   }
  *
  * Concurrency: only one runner per machine. ensureRunning() refuses to
  * spawn a second copy if the recorded PID is alive — instead it returns
  * the existing handle.
+ *
+ * Backward compat: pre-A2A handles wrote `webhook_port` instead of
+ * `server_port`. readHandle() normalizes both into `server_port` so older
+ * persona installs are picked up without losing the daemon.
  */
 
 import { spawn } from "node:child_process";
@@ -35,7 +39,8 @@ export interface DaemonHandle {
   pid: number;
   started_at: string;
   config_path: string;
-  webhook_port: number;
+  /** A2A bind port. The runner listens here for `message/send` traffic. */
+  server_port: number;
   internal_port: number;
   entity_url: string;
   registry_url: string;
@@ -47,10 +52,9 @@ export interface SpawnOpts {
   keypairPath: string;
   registryUrl: string;
   entityUrl: string;
-  webhookPort: number;
+  /** A2A bind port. */
+  serverPort: number;
   internalPort: number;
-  useNgrok?: boolean;
-  ngrokAuthToken?: string;
   pricing?: { amount_usd: number; currency: string };
 }
 
@@ -65,7 +69,15 @@ export function readHandle(): DaemonHandle | null {
   const p = handlePath();
   if (!fs.existsSync(p)) return null;
   try {
-    return JSON.parse(fs.readFileSync(p, "utf-8")) as DaemonHandle;
+    const raw = JSON.parse(fs.readFileSync(p, "utf-8")) as Partial<DaemonHandle> & {
+      webhook_port?: number;
+    };
+    // Pre-A2A handles wrote `webhook_port`. Coerce so the rest of the code
+    // sees only `server_port` and old installs don't break post-upgrade.
+    if (raw.server_port == null && raw.webhook_port != null) {
+      raw.server_port = raw.webhook_port;
+    }
+    return raw as DaemonHandle;
   } catch {
     return null;
   }
@@ -128,11 +140,9 @@ export function spawnDaemon(opts: SpawnOpts): DaemonHandle {
     agent_name: opts.agentName,
     keypair_path: opts.keypairPath,
     registry_url: opts.registryUrl,
-    webhook_port: opts.webhookPort,
+    server_port: opts.serverPort,
     entity_url: opts.entityUrl,
     internal_port: opts.internalPort,
-    use_ngrok: opts.useNgrok ?? false,
-    ngrok_auth_token: opts.ngrokAuthToken,
     pricing: opts.pricing,
   };
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
@@ -160,7 +170,7 @@ export function spawnDaemon(opts: SpawnOpts): DaemonHandle {
     pid: child.pid,
     started_at: new Date().toISOString(),
     config_path: configPath,
-    webhook_port: opts.webhookPort,
+    server_port: opts.serverPort,
     internal_port: opts.internalPort,
     entity_url: opts.entityUrl,
     registry_url: opts.registryUrl,

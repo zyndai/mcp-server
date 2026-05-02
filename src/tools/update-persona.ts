@@ -150,8 +150,12 @@ Errors:
           registryUrl,
           entityId: loaded.persona.entity_id,
           keypair: loaded.keypair,
-          fields,
-        });
+          // The A2A SDK renamed `fields` → `updates` to match the registry's
+          // wire spelling. We pass through both keys via this assertion so
+          // either SDK shape works at compile time; runtime sees only
+          // `updates`.
+          updates: fields,
+        } as unknown as Parameters<typeof DNSRegistryClient.updateEntity>[0]);
 
         const lines: string[] = [
           `**Persona updated on AgentDNS.**`,
@@ -172,7 +176,7 @@ Errors:
               keypairPath: loaded.persona.keypair_path,
               registryUrl,
               entityUrl: effectiveEntityUrl,
-              webhookPort: currentDaemon.webhook_port,
+              serverPort: currentDaemon.server_port,
               internalPort: currentDaemon.internal_port,
             });
             lines.push(``);

@@ -6,7 +6,7 @@
  * back to the user without paraphrasing.
  */
 
-import type { EntityCard, AgentSearchResponse, PaymentInfo } from "../types.js";
+import type { AgentCard, AgentSearchResponse, PaymentInfo } from "../types.js";
 import { CHARACTER_LIMIT } from "../constants.js";
 
 export function formatSearchResults(
@@ -45,9 +45,19 @@ export function formatSearchResults(
   return truncate(lines.join("\n"));
 }
 
-export function formatEntityCard(card: EntityCard): string {
+/**
+ * Format a post-A2A AgentCard. The card shape is much flatter than the
+ * pre-A2A EntityCard — most fields are at the top level (no `endpoints`
+ * sub-object) and signatures are JWS-detached entries under
+ * `signatures[]` rather than a single inline `signature` string. We
+ * tolerate both shapes via property-existence checks so callers reading
+ * legacy cards through the same formatter still get sensible output.
+ */
+export function formatEntityCard(card: AgentCard): string {
+  const get = (k: string): unknown => (card as Record<string, unknown>)[k];
+
   const lines: string[] = [
-    `**${card.name}** \`${card.entity_id}\``,
+    `**${card.name}** \`${card.entity_id ?? "(no entity_id)"}\``,
     "",
   ];
 
@@ -57,71 +67,139 @@ export function formatEntityCard(card: EntityCard): string {
   }
 
   lines.push("**Identity**");
-  lines.push(`- Entity ID: \`${card.entity_id}\``);
-  lines.push(`- Public key: \`${card.public_key}\``);
-  if (card.signature) {
-    lines.push(`- Signed: yes (\`${truncateMiddle(card.signature, 40)}\`)`);
+  if (card.entity_id) lines.push(`- Entity ID: \`${card.entity_id}\``);
+  const publicKey = get("publicKey") ?? get("public_key");
+  if (typeof publicKey === "string") {
+    lines.push(`- Public key: \`${publicKey}\``);
+  }
+  if (typeof card.fqan === "string" && card.fqan) {
+    lines.push(`- FQAN: \`${card.fqan}\``);
+  }
+  // A2A cards: signatures[] is JWS-detached. Pre-A2A cards: a single
+  // inline `signature` string.
+  const sigsArr = get("signatures");
+  const inlineSig = get("signature");
+  if (Array.isArray(sigsArr) && sigsArr.length > 0) {
+    lines.push(`- Signed: yes (${sigsArr.length} JWS signature${sigsArr.length === 1 ? "" : "s"})`);
+  } else if (typeof inlineSig === "string" && inlineSig) {
+    lines.push(`- Signed: yes (\`${truncateMiddle(inlineSig, 40)}\`)`);
   } else {
     lines.push(`- Signed: no`);
   }
+  if (typeof card.version === "string") lines.push(`- Version: ${card.version}`);
   lines.push("");
 
-  if (card.category || card.tags?.length) {
+  if (typeof get("category") === "string" || card.tags?.length) {
     lines.push("**Discovery**");
-    if (card.category) lines.push(`- Category: ${card.category}`);
+    const category = get("category");
+    if (typeof category === "string") lines.push(`- Category: ${category}`);
     if (card.tags?.length) lines.push(`- Tags: ${card.tags.join(", ")}`);
     lines.push("");
   }
 
-  if (card.capabilities?.length) {
-    lines.push("**Capabilities**");
-    for (const cap of card.capabilities) {
-      lines.push(`- ${cap.name} (${cap.category})`);
+  // Skills list (A2A native).
+  const skills = get("skills");
+  if (Array.isArray(skills) && skills.length > 0) {
+    lines.push("**Skills**");
+    for (const s of skills) {
+      if (s && typeof s === "object") {
+        const sk = s as Record<string, unknown>;
+        const id = typeof sk.id === "string" ? sk.id : "(no id)";
+        const name = typeof sk.name === "string" ? sk.name : id;
+        lines.push(`- ${name} \`${id}\``);
+        if (typeof sk.description === "string") {
+          lines.push(`    ${sk.description}`);
+        }
+      }
     }
     lines.push("");
   }
 
-  if (card.endpoints) {
+  // A2A endpoint: `url` is the JSON-RPC endpoint, `additionalInterfaces`
+  // lists alternate transports. Pre-A2A `endpoints.invoke` etc. are
+  // surfaced for back-compat when present.
+  const a2aUrl = card.url;
+  const additionalIfaces = card.additionalInterfaces;
+  const legacyEndpoints = get("endpoints") as Record<string, unknown> | undefined;
+  if (a2aUrl || additionalIfaces?.length || legacyEndpoints) {
     lines.push("**Endpoints**");
-    if (card.endpoints.invoke) lines.push(`- Sync invoke: ${card.endpoints.invoke}`);
-    if (card.endpoints.invoke_async) lines.push(`- Async invoke: ${card.endpoints.invoke_async}`);
-    if (card.endpoints.health) lines.push(`- Health: ${card.endpoints.health}`);
-    if (card.endpoints.agent_card) lines.push(`- Card: ${card.endpoints.agent_card}`);
+    if (typeof a2aUrl === "string" && a2aUrl) {
+      lines.push(`- A2A (JSON-RPC): ${a2aUrl}`);
+    }
+    if (Array.isArray(additionalIfaces)) {
+      for (const iface of additionalIfaces) {
+        if (typeof iface?.url === "string" && typeof iface?.transport === "string") {
+          lines.push(`- ${iface.transport}: ${iface.url}`);
+        }
+      }
+    }
+    if (legacyEndpoints) {
+      // Pre-A2A shape — preserve the old field names for clarity.
+      if (typeof legacyEndpoints["invoke"] === "string") {
+        lines.push(`- Sync invoke (legacy): ${legacyEndpoints["invoke"]}`);
+      }
+      if (typeof legacyEndpoints["invoke_async"] === "string") {
+        lines.push(`- Async invoke (legacy): ${legacyEndpoints["invoke_async"]}`);
+      }
+      if (typeof legacyEndpoints["health"] === "string") {
+        lines.push(`- Health (legacy): ${legacyEndpoints["health"]}`);
+      }
+      if (typeof legacyEndpoints["agent_card"] === "string") {
+        lines.push(`- Card (legacy): ${legacyEndpoints["agent_card"]}`);
+      }
+    }
     lines.push("");
   }
 
   if (card.pricing) {
     lines.push("**Pricing**");
-    lines.push(`- Model: ${card.pricing.model}`);
-    lines.push(`- Currency: ${card.pricing.currency}`);
+    if (card.pricing.model) lines.push(`- Model: ${card.pricing.model}`);
+    if (card.pricing.currency) lines.push(`- Currency: ${card.pricing.currency}`);
     const rates = Object.entries(card.pricing.rates ?? {});
     if (rates.length) {
       for (const [k, v] of rates) lines.push(`- ${k}: ${v}`);
     }
-    if (card.pricing.payment_methods?.length) {
-      lines.push(`- Payment methods: ${card.pricing.payment_methods.join(", ")}`);
+    // Tolerate both A2A camelCase and legacy snake_case payment field names.
+    const paymentMethods =
+      card.pricing.paymentMethods ??
+      ((card.pricing as Record<string, unknown>)["payment_methods"] as
+        | string[]
+        | undefined);
+    if (paymentMethods?.length) {
+      lines.push(`- Payment methods: ${paymentMethods.join(", ")}`);
     }
     lines.push("");
   }
 
-  if (card.input_schema || card.output_schema || card.accepts_files) {
+  // I/O contract — A2A cards expose `inputSchema`/`outputSchema` (camelCase),
+  // pre-A2A used snake_case.
+  const inputSchema = get("inputSchema") ?? get("input_schema");
+  const outputSchema = get("outputSchema") ?? get("output_schema");
+  const acceptsFiles = get("acceptsFiles") ?? get("accepts_files");
+  if (inputSchema || outputSchema || acceptsFiles) {
     lines.push("**Contract**");
-    if (card.input_schema) {
-      lines.push(`- Input schema: ${stringifyCompact(card.input_schema)}`);
+    if (inputSchema) {
+      lines.push(`- Input schema: ${stringifyCompact(inputSchema)}`);
     }
-    if (card.output_schema) {
-      lines.push(`- Output schema: ${stringifyCompact(card.output_schema)}`);
+    if (outputSchema) {
+      lines.push(`- Output schema: ${stringifyCompact(outputSchema)}`);
     }
-    if (card.accepts_files) {
+    if (acceptsFiles === true) {
       lines.push(`- Accepts file uploads: yes`);
     }
     lines.push("");
   }
 
-  lines.push("**Status**");
-  lines.push(`- Status: ${card.status}`);
-  lines.push(`- Last heartbeat: ${card.last_heartbeat}`);
-  lines.push(`- Signed at: ${card.signed_at}`);
+  // Status / heartbeat are still surfaced when the registry attached them.
+  const status = get("status");
+  const lastHeartbeat = get("last_heartbeat") ?? get("lastHeartbeat");
+  const signedAt = get("signed_at") ?? get("signedAt");
+  if (status || lastHeartbeat || signedAt) {
+    lines.push("**Status**");
+    if (status) lines.push(`- Status: ${String(status)}`);
+    if (lastHeartbeat) lines.push(`- Last heartbeat: ${String(lastHeartbeat)}`);
+    if (signedAt) lines.push(`- Signed at: ${String(signedAt)}`);
+  }
 
   return truncate(lines.join("\n"));
 }

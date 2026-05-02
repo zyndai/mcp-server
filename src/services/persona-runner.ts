@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Persona runner — the detached background agent that hosts the user's
- * Claude persona on the Zynd network.
+ * Claude persona on the Zynd network (post-A2A).
  *
  * The runner is spawned by the MCP server's `register-persona` tool with
  * `child_process.spawn(detached:true)`, so it survives the MCP host (Claude
@@ -10,18 +10,25 @@
  *
  * Lifecycle:
  *   1. Read persona config (entity_id, keypair path, registry, public URL,
- *      webhook port, internal-reply port) from $ZYND_PERSONA_CONFIG.
- *   2. Boot a ZyndAIAgent with a no-op custom handler — the SDK's webhook
- *      server still runs, accepts /webhook + /webhook/sync, and the
- *      addMessageHandler hook below intercepts each inbound message.
- *   3. For every inbound message: append to ~/.zynd/mailbox/<entity_id>.jsonl
- *      and immediately ack the /webhook/sync caller with a "queued for human
- *      approval" sentinel so they don't wait for the SDK's 30s timeout.
- *   4. Expose a 127.0.0.1-only HTTP server on `internalPort` with a single
+ *      A2A bind port, internal-reply port) from $ZYND_PERSONA_CONFIG.
+ *   2. Boot a ZyndAIAgent with an A2A handler that:
+ *        - files every inbound A2A message in
+ *          ~/.zynd/mailbox/<entity_id>.jsonl
+ *        - immediately returns a "queued for human approval" sentinel so
+ *          the original caller's HTTP request settles fast and doesn't
+ *          hold a connection open while the user is asleep.
+ *   3. Expose a 127.0.0.1-only HTTP server on `internalPort` with a single
  *      route POST /internal/reply { message_id, response, approve } — the
  *      MCP `respond-to-request` tool calls this once the user has approved.
- *      The runner then POSTs the reply to the sender's webhook (looked up
- *      via the registry) so the original sender finally hears back.
+ *      The runner then sends a NEW signed A2A message to the original
+ *      sender (resolved via the registry) so they finally hear back.
+ *
+ * Why push-OUT instead of A2A's input-required loopback:
+ *   The human-in-the-loop pattern can take hours/days. A2A's
+ *   `input-required` state expects the SAME caller to keep polling or hold
+ *   an SSE stream open — that's not the right shape for asynchronous human
+ *   approval. Sending a fresh A2A message back to the sender also lets the
+ *   sender's own A2A server thread it via `contextId` if they care.
  *
  * The runner is intentionally process-isolated from the MCP server — Claude
  * Desktop killing the MCP child does not kill this process, and a crash here
@@ -33,7 +40,14 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ZyndAIAgent, SearchAndDiscoveryManager, AgentConfigSchema } from "zyndai";
+import {
+  A2AClient,
+  AgentConfigSchema,
+  SearchAndDiscoveryManager,
+  ZyndAIAgent,
+  type HandlerInput,
+  type TaskHandle,
+} from "zyndai";
 import { appendEntry, findEntry, updateStatus, type MailboxEntry } from "./mailbox.js";
 
 if (!globalThis.crypto) {
@@ -45,13 +59,12 @@ interface PersonaConfig {
   agent_name: string;
   keypair_path: string;
   registry_url: string;
-  webhook_port: number;
+  /** A2A bind port (0.0.0.0:<port>). */
+  server_port: number;
   /** Public URL the persona is registered with — used for sanity logging only. */
   entity_url: string;
   /** 127.0.0.1 port the MCP talks to for /internal/reply. */
   internal_port: number;
-  use_ngrok?: boolean;
-  ngrok_auth_token?: string;
   pricing?: { amount_usd: number; currency: string };
 }
 
@@ -75,19 +88,22 @@ function loadConfig(): PersonaConfig {
   return JSON.parse(fs.readFileSync(p, "utf-8")) as PersonaConfig;
 }
 
+const QUEUED_RESPONSE =
+  "queued: this persona is human-in-the-loop. The user will be asked, and if approved a reply will be delivered out-of-band as a new A2A message.";
+
 async function main(): Promise<void> {
   const cfg = loadConfig();
-  log("starting persona runner", { entity_id: cfg.entity_id, port: cfg.webhook_port });
+  log("starting persona runner", { entity_id: cfg.entity_id, port: cfg.server_port });
 
   const agentConfig = AgentConfigSchema.parse({
     name: cfg.agent_name,
     description: `Claude-hosted persona for ${cfg.agent_name}`,
     keypairPath: cfg.keypair_path,
-    webhookPort: cfg.webhook_port,
+    serverHost: "0.0.0.0",
+    serverPort: cfg.server_port,
+    authMode: "permissive",
     registryUrl: cfg.registry_url,
     entityUrl: cfg.entity_url,
-    useNgrok: cfg.use_ngrok ?? false,
-    ngrokAuthToken: cfg.ngrok_auth_token,
     tags: ["claude-persona", "mcp-client", "human-in-the-loop"],
     category: "persona",
     ...(cfg.pricing
@@ -101,34 +117,45 @@ async function main(): Promise<void> {
   });
   const agent = new ZyndAIAgent(agentConfig);
 
-  // Inbound message handler: file the message in the mailbox, ack the
-  // /webhook/sync request immediately so the sender isn't blocked, and
-  // surface the message via MCP for the human to review.
-  agent.webhook.addMessageHandler(async (msg) => {
+  // Inbound A2A handler: file the message in the mailbox, ack the caller
+  // immediately so they aren't blocked, and surface the message via MCP for
+  // the human to review. Auth (x-zynd-auth signature, replay, expiry) is
+  // verified by the SDK BEFORE this fires.
+  agent.onMessage(async (input: HandlerInput, _task: TaskHandle) => {
+    const message = input.message;
+    const senderEntityId = message.senderId || "unknown";
+    const senderPublicKey = message.senderPublicKey;
+    const messageId = message.messageId;
+    const contextId = message.conversationId;
+
     const entry: MailboxEntry = {
-      message_id: msg.messageId,
-      sender_id: msg.senderId,
-      sender_public_key: msg.senderPublicKey,
-      content: msg.content,
-      conversation_id: msg.conversationId,
-      metadata: msg.metadata,
+      message_id: messageId,
+      sender_id: senderEntityId,
+      sender_public_key: senderPublicKey,
+      content: message.content,
+      conversation_id: contextId,
+      metadata: {
+        ...message.metadata,
+        // Stash A2A-specific fields so deliverReply can thread the answer
+        // back into the same conversation.
+        _a2a_context_id: contextId,
+        _a2a_signed: input.signed,
+      },
       received_at: new Date().toISOString(),
       status: "pending",
     };
     appendEntry(cfg.entity_id, entry);
-    log("inbound", { message_id: msg.messageId, sender: msg.senderId });
+    log("inbound", { message_id: messageId, sender: senderEntityId, signed: input.signed });
 
-    // Sync callers get an immediate "queued" ack instead of waiting 30s.
-    // Real reply is delivered out-of-band to the sender's webhook once the
-    // human approves it — see /internal/reply below.
-    agent.webhook.setResponse(
-      msg.messageId,
-      "queued: this persona is human-in-the-loop. Reply will be delivered to your webhook when the user approves.",
-    );
+    // Returning a string (or {response: string}) auto-completes the task —
+    // the SDK ships it as the task's first artifact. The original caller's
+    // `message/send` request settles right away; the real reply is pushed
+    // out-of-band when the human approves.
+    return { response: QUEUED_RESPONSE };
   });
 
   await agent.start();
-  log("agent started", { url: cfg.entity_url });
+  log("agent started", { url: cfg.entity_url, a2a: agent.a2aUrl });
 
   // Internal HTTP server — only the MCP server (running on the same machine
   // as the user) calls this, so it binds to 127.0.0.1 and rejects everything
@@ -192,46 +219,76 @@ async function main(): Promise<void> {
   process.on("uncaughtException", (err) => log("uncaught", String(err)));
 }
 
+/**
+ * Send a fresh signed A2A message to the original sender containing the
+ * human-approved reply. Threaded into the same `contextId` (when known)
+ * so the sender's own conversation memory groups it with the original
+ * message.
+ */
 async function deliverReply(
   agent: ZyndAIAgent,
   cfg: PersonaConfig,
   entry: MailboxEntry,
   response: string,
 ): Promise<void> {
-  // Look up the sender's webhook URL on the registry.
+  // Resolve the sender's public AgentCard via the registry so we know
+  // where to send the reply.
   const search = new SearchAndDiscoveryManager(cfg.registry_url);
   const senderCard = await search.getAgentById(entry.sender_id).catch((e) => {
     throw new Error(`sender ${entry.sender_id} not resolvable on registry: ${String(e)}`);
   });
 
-  const senderEntityUrl = pickSenderUrl(senderCard);
-  if (!senderEntityUrl) {
-    throw new Error(`sender card has no usable webhook endpoint for ${entry.sender_id}`);
+  const senderEndpoint = pickSenderA2AEndpoint(senderCard);
+  if (!senderEndpoint) {
+    throw new Error(`sender card has no A2A endpoint for ${entry.sender_id}`);
   }
 
-  await agent.webhook.sendMessage(senderEntityUrl, response, {
-    receiverId: entry.sender_id,
-    metadata: {
-      in_reply_to: entry.message_id,
-      persona: cfg.entity_id,
-      ...(entry.conversation_id ? { conversation_id: entry.conversation_id } : {}),
-    },
-    messageType: "response",
+  const client = new A2AClient({
+    keypair: agent.keypair,
+    entityId: cfg.entity_id,
+  });
+
+  const contextId =
+    typeof entry.metadata?.["_a2a_context_id"] === "string"
+      ? (entry.metadata["_a2a_context_id"] as string)
+      : entry.conversation_id;
+
+  await client.sync({
+    url: senderEndpoint,
+    text: response,
+    contextId: contextId ?? undefined,
+    blocking: false,
+    timeoutMs: 30_000,
   });
 }
 
-function pickSenderUrl(card: Record<string, unknown> | null): string | null {
+/**
+ * Read the A2A endpoint URL from a registry-returned AgentCard. Tries the
+ * canonical `url` field first, then the `additionalInterfaces[]` array,
+ * then reconstructs from `entity_url`.
+ */
+function pickSenderA2AEndpoint(card: Record<string, unknown> | null): string | null {
   if (!card) return null;
-  const endpoints = card["endpoints"] as Record<string, unknown> | undefined;
-  if (endpoints) {
-    const async_ = endpoints["invoke_async"];
-    if (typeof async_ === "string") return async_;
-    const sync_ = endpoints["invoke"];
-    if (typeof sync_ === "string") return sync_;
+  if (typeof card["url"] === "string" && card["url"]) return card["url"] as string;
+
+  const ifaces = card["additionalInterfaces"];
+  if (Array.isArray(ifaces)) {
+    for (const i of ifaces) {
+      if (
+        i &&
+        typeof i === "object" &&
+        typeof (i as Record<string, unknown>)["url"] === "string" &&
+        typeof (i as Record<string, unknown>)["transport"] === "string" &&
+        ((i as Record<string, unknown>)["transport"] as string).toUpperCase() === "JSONRPC"
+      ) {
+        return (i as Record<string, unknown>)["url"] as string;
+      }
+    }
   }
+
   const entityUrl = card["entity_url"];
-  if (typeof entityUrl === "string") {
-    return `${entityUrl.replace(/\/+$/, "")}/webhook`;
+  if (typeof entityUrl === "string" && entityUrl) {
+    return `${entityUrl.replace(/\/+$/, "")}/a2a/v1`;
   }
   return null;
 }

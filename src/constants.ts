@@ -7,7 +7,7 @@
  * or a self-hosted dev node.
  */
 
-export const DEFAULT_REGISTRY_URL = "https://dns01.zynd.ai";
+export const DEFAULT_REGISTRY_URL = "https://zns01.zynd.ai";
 
 /** Hard cap on a single MCP tool response payload — protects the model context window. */
 export const CHARACTER_LIMIT = 25_000;
@@ -15,7 +15,7 @@ export const CHARACTER_LIMIT = 25_000;
 /** Timeout for registry HTTP requests (search / get / card). */
 export const REQUEST_TIMEOUT_MS = 30_000;
 
-/** Timeout for `POST /webhook/sync` agent invocations. Longer because the agent might be running an LLM. */
+/** Timeout for A2A `message/send` calls. Longer because the agent may be running an LLM. */
 export const CALL_AGENT_TIMEOUT_MS = 60_000;
 
 /** Default search results returned when the user doesn't specify `limit`. */

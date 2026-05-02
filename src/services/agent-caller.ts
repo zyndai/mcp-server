@@ -1,94 +1,93 @@
 /**
- * Agent invocation — sends an AgentMessage to a registered AgentDNS agent
- * and returns its response.
+ * Agent invocation — sends a signed A2A message to a registered agent and
+ * returns its reply.
  *
- * Resolution order for the invoke URL (matches the TS SDK's `connectAgent()`
- * logic — duplicated here to keep this file dependency-light and easy to
- * audit):
+ * The post-A2A flow:
+ *   1. Resolve the JSON-RPC endpoint advertised on the AgentCard (`card.url`)
+ *      with a fallback to `<entity_url>/a2a/v1` for older agents.
+ *   2. Build an A2A `Message` with a TextPart, sign it with the active
+ *      persona's keypair (or generate a one-shot anonymous keypair when
+ *      there's no persona), and call `message/send` via `A2AClient.sync()`.
+ *   3. Pull the reply text out of the returned Task's artifacts (NOT
+ *      `task.history` — that includes the caller's outbound message echoed
+ *      back, which would feed an LLM tool a copy of its own input). The
+ *      SDK's `taskReplyText()` helper already handles the priority chain
+ *      (artifacts → status.message → history fallback).
  *
- *   1. card.endpoints.invoke    — what the agent advertises on its card
- *   2. ${entity_url}/webhook/sync — fallback for older agents
- *
- * x402 payments are auto-handled by the wrapped fetch when the agent's card
- * advertises pricing and `ZYNDAI_PAYMENT_PRIVATE_KEY` is set.
+ * x402 payments still flow through the @x402/fetch wrapper, so the
+ * `payment-response` settlement header is captured the same way as before
+ * by patching `globalThis.fetch` for the call's lifetime — A2AClient uses
+ * the global `fetch`, so that's our injection point.
  */
 
 import { randomUUID } from "node:crypto";
-import { AgentMessage, type EntityCard } from "zyndai";
+import {
+  A2AClient,
+  generateKeypair,
+  taskReplyText,
+  type ATask,
+  type Ed25519Keypair,
+} from "zyndai";
 import { CALL_AGENT_TIMEOUT_MS, MCP_SENDER_ID } from "../constants.js";
 import { getPaymentFetchAsync } from "./payment.js";
 import { loadActivePersonaKeypair } from "./identity-store.js";
-import type {
-  CallAgentResult,
-  PaymentInfo,
-  WebhookSyncResponse,
-} from "../types.js";
+import type { AgentCard, CallAgentResult, PaymentInfo } from "../types.js";
 
 export interface CallAgentParams {
-  card: EntityCard;
+  card: AgentCard;
   message: string;
-  conversationId?: string;
+  /** Continue an existing A2A conversation. */
+  contextId?: string;
+  /** Continue (rather than open) an existing task — used for input-required loopbacks. */
+  taskId?: string;
 }
 
 export async function callAgent({
   card,
   message,
-  conversationId,
+  contextId,
+  taskId,
 }: CallAgentParams): Promise<CallAgentResult> {
-  const invokeUrl = resolveInvokeUrl(card);
+  const endpoint = resolveA2AEndpoint(card);
 
-  // If the user has registered a Claude persona, sign outgoing calls with
-  // that identity so the recipient sees a real, registry-verifiable
-  // sender_id. Falls back to the generic MCP_SENDER_ID for unauthenticated
-  // callers (read tools work without a persona).
+  // Sender identity:
+  //   - active persona  → registry-verifiable sender_id (preferred)
+  //   - no persona     → generate a one-shot anonymous keypair so we can
+  //                       still emit a valid x-zynd-auth signature. The
+  //                       receiver decides what to do with an unknown
+  //                       sender (their authMode setting governs that).
   const persona = loadActivePersonaKeypair();
-  const senderId = persona?.persona.entity_id ?? MCP_SENDER_ID;
-  const senderPublicKey = persona?.keypair.publicKeyString;
+  const senderKeypair: Ed25519Keypair = persona?.keypair ?? generateKeypair();
+  const senderId = persona?.persona.entity_id ?? senderKeypair.entityId;
+  const senderName =
+    persona?.persona.agent_name ?? MCP_SENDER_ID;
 
-  const agentMessage = new AgentMessage({
-    content: message,
-    senderId,
-    senderPublicKey,
-    receiverId: card.entity_id,
-    messageType: "query",
-    conversationId,
-    metadata: {
-      source: "mcp-server",
-      tool: "zyndai_call_agent",
-      ...(persona ? { persona_name: persona.persona.agent_name } : {}),
-    },
+  const client = new A2AClient({
+    keypair: senderKeypair,
+    entityId: senderId,
   });
 
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), CALL_AGENT_TIMEOUT_MS);
+  const messageId = randomUUID();
+  const conversationId = contextId ?? randomUUID();
 
+  // Capture x402 settlement metadata. A2AClient calls `fetch()` directly,
+  // so we wrap globalThis.fetch with the @x402/fetch payment wrapper for
+  // the duration of this call only and snoop the `payment-response`
+  // header off the response that comes back to the wrapper.
   const payment: PaymentInfo = {
     paid: false,
     transaction: null,
     network: null,
     payer: null,
   };
-
-  try {
-    const fetchFn = await getPaymentFetchAsync();
-
-    const response = await fetchFn(invokeUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(agentMessage.toDict()),
-      signal: ctl.signal,
-    });
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      throw new Error(
-        `Agent ${card.entity_id} returned HTTP ${response.status}: ${body || response.statusText}`,
-      );
-    }
-
-    // x402 settlement metadata is returned in the `payment-response` header
-    // by the @x402/fetch wrapper after a successful paid call.
-    const settlement = response.headers.get("payment-response");
+  const originalFetch = globalThis.fetch;
+  const paymentFetch = await getPaymentFetchAsync();
+  globalThis.fetch = (async (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ): Promise<Response> => {
+    const resp = await paymentFetch(input as never, init as never);
+    const settlement = resp.headers.get("payment-response");
     if (settlement) {
       try {
         const parsed = JSON.parse(settlement) as Record<string, unknown>;
@@ -100,74 +99,82 @@ export async function callAgent({
         payment.paid = true;
       }
     }
+    return resp;
+  }) as typeof fetch;
 
-    const rawBody = await response.text();
-    if (!rawBody.trim()) {
-      throw new Error(
-        `Agent ${card.entity_id} returned an empty response — workflow may be inactive.`,
-      );
-    }
-
-    let data: WebhookSyncResponse;
-    try {
-      data = JSON.parse(rawBody) as WebhookSyncResponse;
-    } catch {
-      // Non-JSON body — pass through as-is.
-      return {
-        response: rawBody,
-        entityId: card.entity_id,
-        agentName: card.name,
-        messageId: agentMessage.messageId,
-        conversationId: agentMessage.conversationId,
-        payment,
-        signatureVerified: null,
-      };
-    }
-
-    const responseText =
-      data.response ??
-      data.output ??
-      data.status ??
-      JSON.stringify(data);
-
-    // Signature verification is intentionally a stub for v2.0.0 — we surface
-    // whether a signature was present so the caller can choose to verify
-    // out-of-band, but full verification (Ed25519 over canonical JSON) lands
-    // in v2.1 once we standardize the response signing envelope.
-    const signatureVerified =
-      typeof data.signature === "string" && data.signature.length > 0
-        ? null
-        : null;
-
-    return {
-      response: responseText,
-      entityId: card.entity_id,
-      agentName: card.name,
-      messageId: agentMessage.messageId,
-      conversationId: agentMessage.conversationId,
-      payment,
-      signatureVerified,
-    };
+  let task: ATask;
+  try {
+    task = await client.sync({
+      url: endpoint,
+      text: message,
+      contextId: conversationId,
+      ...(taskId ? { taskId } : {}),
+      blocking: true,
+      timeoutMs: CALL_AGENT_TIMEOUT_MS,
+    });
   } finally {
-    clearTimeout(timer);
+    globalThis.fetch = originalFetch;
   }
+
+  const responseText = taskReplyText(task) ?? "";
+  // Reply-side signature verification stays a `null` baseline for now —
+  // see the comment on CallAgentResult.signatureVerified in types.ts.
+  const signatureVerified: boolean | null = null;
+
+  return {
+    response: responseText,
+    entityId: (card.entity_id as string) ?? card.name,
+    agentName: typeof card.name === "string" ? card.name : senderName,
+    messageId,
+    contextId: task.contextId ?? conversationId,
+    taskId: task.id,
+    taskState: (task.status?.state as string) ?? "unknown",
+    task,
+    payment,
+    signatureVerified,
+  };
 }
 
 /**
- * Read the invoke URL the agent advertises on its card. We trust the card
- * because it's signed at the registry — if `endpoints.invoke` isn't present
- * (very old agent), reconstruct from `entity_url + /webhook/sync`.
+ * Pick the A2A endpoint URL from an AgentCard.
+ *
+ *   1. `card.url`   — the canonical post-A2A field (JSON-RPC endpoint, e.g.
+ *                    `https://x/a2a/v1`). What `buildAgentCard` writes.
+ *   2. `card.additionalInterfaces[].url` where `transport === "JSONRPC"` —
+ *                    fallback for cards that ship multiple transports.
+ *   3. `<entity_url>/a2a/v1` — last-resort reconstruction for legacy cards.
  */
-function resolveInvokeUrl(card: EntityCard): string {
-  const advertised = card.endpoints?.invoke;
-  if (advertised) return advertised;
-  return `${card.entity_url.replace(/\/+$/, "")}/webhook/sync`;
+function resolveA2AEndpoint(card: AgentCard): string {
+  if (typeof card.url === "string" && card.url) return card.url;
+
+  const ifaces = card.additionalInterfaces ?? [];
+  for (const iface of ifaces) {
+    if (
+      typeof iface?.url === "string" &&
+      typeof iface?.transport === "string" &&
+      iface.transport.toUpperCase() === "JSONRPC"
+    ) {
+      return iface.url;
+    }
+  }
+
+  const baseUrl =
+    (card as { baseUrl?: string }).baseUrl ??
+    (card as { entity_url?: string }).entity_url;
+  if (typeof baseUrl === "string" && baseUrl) {
+    return `${baseUrl.replace(/\/+$/, "")}/a2a/v1`;
+  }
+
+  throw new Error(
+    `Agent card for ${card.name ?? card.entity_id ?? "(unknown)"} has no A2A endpoint`,
+  );
 }
 
 /**
  * Generate a fresh conversation id when the caller doesn't supply one.
- * Exposed for tests; the AgentMessage constructor would otherwise generate
- * one anyway.
+ * Exposed for tests; A2AClient.sync() would otherwise generate one on its
+ * own, but tools that want to surface the contextId in their reply need
+ * to mint it before the call.
  */
 export function newConversationId(): string {
   return randomUUID();
