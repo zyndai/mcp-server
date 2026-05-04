@@ -24,7 +24,9 @@ import { randomUUID } from "node:crypto";
 import {
   A2AClient,
   generateKeypair,
+  resolveTransportFromCard,
   taskReplyText,
+  type A2ATransport,
   type ATask,
   type Ed25519Keypair,
 } from "zyndai";
@@ -37,9 +39,14 @@ import type { AgentCard, CallAgentResult, PaymentInfo } from "../types.js";
 
 export type CallMode = "auto" | "sync" | "stream" | "push";
 
+export type TransportPref = A2ATransport | "auto";
+
 export interface CallAgentParams {
   card: AgentCard;
-  message: string;
+  /** Free-form text — sent as a TextPart. */
+  message?: string;
+  /** Structured payload — sent as a DataPart. Use for services with input_schema. */
+  payload?: Record<string, unknown>;
   /** Continue an existing A2A conversation. */
   contextId?: string;
   /** Continue (rather than open) an existing task — used for input-required loopbacks. */
@@ -54,16 +61,27 @@ export interface CallAgentParams {
    *              agent settles. Use zyndai_async_replies to fetch.
    */
   mode?: CallMode;
+  /**
+   * Wire transport. "auto" follows the card's preferredTransport; "JSONRPC"
+   * or "HTTP+JSON" forces the matching interface (and throws if not
+   * advertised). Push mode currently requires JSONRPC.
+   */
+  transport?: TransportPref;
 }
 
 export async function callAgent({
   card,
   message,
+  payload,
   contextId,
   taskId,
   mode = "auto",
+  transport = "auto",
 }: CallAgentParams): Promise<CallAgentResult> {
-  const endpoint = resolveA2AEndpoint(card);
+  if (message === undefined && payload === undefined) {
+    throw new Error("callAgent requires either `message` (TextPart) or `payload` (DataPart).");
+  }
+  const resolved = resolveTransport(card, transport);
 
   // Sender identity:
   //   - active persona  → registry-verifiable sender_id (preferred)
@@ -118,7 +136,11 @@ export async function callAgent({
   }) as typeof fetch;
 
   // Resolve effective mode + push config once.
-  const effectiveMode = resolveMode(mode, card, message);
+  const effectiveMode = resolveMode(
+    mode,
+    card,
+    message ?? (payload ? JSON.stringify(payload) : ""),
+  );
   const pushCfg =
     effectiveMode === "push" ? buildPushConfig(persona?.persona.entity_id) : null;
 
@@ -127,9 +149,13 @@ export async function callAgent({
     if (effectiveMode === "push" && pushCfg) {
       // Non-blocking — agent ack's the kickoff and shuts the connection.
       // The eventual result lands at our callback URL via the persona-runner.
+      // Push mode requires JSONRPC (the only transport push-callback config
+      // is spec'd over today).
       task = await client.sync({
-        url: endpoint,
-        text: message,
+        url: resolved.url,
+        transport: "JSONRPC",
+        ...(message !== undefined ? { text: message } : {}),
+        ...(payload !== undefined ? { data: payload } : {}),
         contextId: conversationId,
         ...(taskId ? { taskId } : {}),
         blocking: false,
@@ -150,8 +176,10 @@ export async function callAgent({
       // here — the MCP tool surface doesn't expose intermediate progress
       // events.)
       task = await client.sync({
-        url: endpoint,
-        text: message,
+        url: resolved.url,
+        transport: resolved.transport,
+        ...(message !== undefined ? { text: message } : {}),
+        ...(payload !== undefined ? { data: payload } : {}),
         contextId: conversationId,
         ...(taskId ? { taskId } : {}),
         blocking: true,
@@ -168,9 +196,9 @@ export async function callAgent({
     registerOutboundTask({
       task_id: task.id,
       context_id: task.contextId ?? conversationId,
-      target_url: endpoint,
-      target_entity_id: (card.entity_id as string) ?? endpoint,
-      outbound_message: message,
+      target_url: resolved.url,
+      target_entity_id: (card.entity_id as string) ?? resolved.url,
+      outbound_message: message ?? (payload ? JSON.stringify(payload) : ""),
       callback_url: pushCfg.url,
       callback_token: pushCfg.token,
       registered_at: new Date().toISOString(),
@@ -247,38 +275,30 @@ function buildPushConfig(_personaId: string | undefined): {
 }
 
 /**
- * Pick the A2A endpoint URL from an AgentCard.
+ * Resolve the {transport, url} pair for an outbound call.
  *
- *   1. `card.url`   — the canonical post-A2A field (JSON-RPC endpoint, e.g.
- *                    `https://x/a2a/v1`). What `buildAgentCard` writes.
- *   2. `card.additionalInterfaces[].url` where `transport === "JSONRPC"` —
- *                    fallback for cards that ship multiple transports.
- *   3. `<entity_url>/a2a/v1` — last-resort reconstruction for legacy cards.
+ *   1. SDK `resolveTransportFromCard` reads `url` + `additionalInterfaces`,
+ *      honors the caller's prefer ("auto" follows preferredTransport).
+ *   2. Falls back to `<baseUrl>/a2a/v1` JSONRPC for legacy cards that
+ *      didn't advertise transports at all.
  */
-function resolveA2AEndpoint(card: AgentCard): string {
-  if (typeof card.url === "string" && card.url) return card.url;
-
-  const ifaces = card.additionalInterfaces ?? [];
-  for (const iface of ifaces) {
-    if (
-      typeof iface?.url === "string" &&
-      typeof iface?.transport === "string" &&
-      iface.transport.toUpperCase() === "JSONRPC"
-    ) {
-      return iface.url;
+function resolveTransport(card: AgentCard, prefer: TransportPref) {
+  try {
+    return resolveTransportFromCard(card, prefer);
+  } catch (err) {
+    const baseUrl =
+      (card as { baseUrl?: string }).baseUrl ??
+      (card as { entity_url?: string }).entity_url;
+    if ((prefer === "auto" || prefer === "JSONRPC") && typeof baseUrl === "string" && baseUrl) {
+      return {
+        transport: "JSONRPC" as A2ATransport,
+        url: `${baseUrl.replace(/\/+$/, "")}/a2a/v1`,
+      };
     }
+    throw new Error(
+      `Agent card for ${card.name ?? card.entity_id ?? "(unknown)"} has no usable transport (${(err as Error).message})`,
+    );
   }
-
-  const baseUrl =
-    (card as { baseUrl?: string }).baseUrl ??
-    (card as { entity_url?: string }).entity_url;
-  if (typeof baseUrl === "string" && baseUrl) {
-    return `${baseUrl.replace(/\/+$/, "")}/a2a/v1`;
-  }
-
-  throw new Error(
-    `Agent card for ${card.name ?? card.entity_id ?? "(unknown)"} has no A2A endpoint`,
-  );
 }
 
 /**

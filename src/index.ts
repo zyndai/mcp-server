@@ -56,6 +56,7 @@ import { registerListAgents } from "./tools/list-agents.js";
 import { registerGetAgent } from "./tools/get-agent.js";
 import { registerResolveFqan } from "./tools/resolve-fqan.js";
 import { registerCallAgent } from "./tools/call-agent.js";
+import { registerCallService } from "./tools/call-service.js";
 
 // Inbox — incoming messages other agents send to this persona.
 import { registerPendingRequestsTool } from "./tools/pending-requests.js";
@@ -82,6 +83,7 @@ registerListAgents(server);
 registerGetAgent(server);
 registerResolveFqan(server);
 registerCallAgent(server);
+registerCallService(server);
 
 // Inbox
 registerPendingRequestsTool(server);

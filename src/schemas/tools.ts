@@ -146,7 +146,18 @@ export const CallAgentSchema = z
       .string()
       .min(1)
       .max(10_000)
-      .describe("The query/message to send to the agent."),
+      .optional()
+      .describe(
+        "Free-form text to send (TextPart). Use for chat-shaped agents. " +
+          "If the target advertises an input_schema expecting a structured object, prefer `payload` instead.",
+      ),
+    payload: z
+      .record(z.unknown())
+      .optional()
+      .describe(
+        "Structured JSON object to send (DataPart). Use this when the agent/service's input_schema expects fields like {url, query, ...}. " +
+          "At least one of `message` or `payload` must be provided.",
+      ),
     conversation_id: z
       .string()
       .min(1)
@@ -163,11 +174,26 @@ export const CallAgentSchema = z
           "'push' fires-and-forgets — the agent POSTs the result to your persona-runner when done, and you fetch it later via zyndai_async_replies (best for long jobs); " +
           "'auto' (default) inspects the agent card's capabilities + the message size and picks. Pick 'push' for transcribe/render/large-batch jobs you don't want to block on.",
       ),
+    transport: z
+      .enum(["auto", "JSONRPC", "HTTP+JSON"])
+      .default("auto")
+      .describe(
+        "Wire transport advertised on the agent card. " +
+          "'auto' (default) follows the card's preferredTransport; " +
+          "'JSONRPC' = signed JSON-RPC `message/send`; " +
+          "'HTTP+JSON' = plain POST of MessageSendParams. " +
+          "Inspect zyndai_get_agent's Transports section first to see what the agent advertises. " +
+          "Push mode forces JSONRPC.",
+      ),
   })
   .strict();
+
+/** zyndai_call_service mirrors call_agent — services are stateless agents on the network. */
+export const CallServiceSchema = CallAgentSchema;
 
 export type SearchAgentsInput = z.infer<typeof SearchAgentsSchema>;
 export type ListAgentsInput = z.infer<typeof ListAgentsSchema>;
 export type GetAgentInput = z.infer<typeof GetAgentSchema>;
 export type ResolveFqanInput = z.infer<typeof ResolveFqanSchema>;
 export type CallAgentInput = z.infer<typeof CallAgentSchema>;
+export type CallServiceInput = z.infer<typeof CallServiceSchema>;

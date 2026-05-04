@@ -115,16 +115,20 @@ export function formatEntityCard(card: AgentCard): string {
     lines.push("");
   }
 
-  // A2A endpoint: `url` is the JSON-RPC endpoint, `additionalInterfaces`
+  // A2A endpoint: `url` is the primary endpoint, `additionalInterfaces`
   // lists alternate transports. Pre-A2A `endpoints.invoke` etc. are
   // surfaced for back-compat when present.
   const a2aUrl = card.url;
   const additionalIfaces = card.additionalInterfaces;
+  const preferredTransport =
+    (typeof get("preferredTransport") === "string"
+      ? (get("preferredTransport") as string)
+      : "JSONRPC") || "JSONRPC";
   const legacyEndpoints = get("endpoints") as Record<string, unknown> | undefined;
   if (a2aUrl || additionalIfaces?.length || legacyEndpoints) {
-    lines.push("**Endpoints**");
+    lines.push("**Transports** _(pass `transport` to zyndai_call_agent / zyndai_call_service to pick one — default = preferred)_");
     if (typeof a2aUrl === "string" && a2aUrl) {
-      lines.push(`- A2A (JSON-RPC): ${a2aUrl}`);
+      lines.push(`- ${preferredTransport} _(preferred)_: ${a2aUrl}`);
     }
     if (Array.isArray(additionalIfaces)) {
       for (const iface of additionalIfaces) {

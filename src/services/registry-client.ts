@@ -57,20 +57,37 @@ export async function searchEntities(
  * returns 404 — older nodes only expose the bare record.
  */
 export async function getEntityCard(entityId: string): Promise<HydratedCard> {
+  const cached = readCardCache(entityId);
+  if (cached) return cached;
+
   const registry = getRegistryUrl();
   // Use AbortController so a slow registry doesn't block the MCP server forever.
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const cardResp = await fetch(
-      `${registry.replace(/\/+$/, "")}/v1/entities/${encodeURIComponent(entityId)}/card`,
-      { signal: ctl.signal, headers: { Accept: "application/json" } },
-    );
+    let cardResp: Response | null = null;
+    try {
+      cardResp = await fetch(
+        `${registry.replace(/\/+$/, "")}/v1/entities/${encodeURIComponent(entityId)}/card`,
+        { signal: ctl.signal, headers: { Accept: "application/json" } },
+      );
+    } catch (netErr) {
+      // Registry unreachable (DNS, refused, abort) — try entity directly if
+      // the entity_id looks like a URL we can derive a base from.
+      const direct = await tryDirectFromEntityId(entityId, ctl.signal);
+      if (direct) return cacheAndReturn(entityId, direct);
+      throw netErr;
+    }
+
     if (cardResp.ok) {
       const card = (await cardResp.json()) as AgentCard;
-      return { card, entityUrl: deriveEntityUrl(card) };
+      return cacheAndReturn(entityId, { card, entityUrl: deriveEntityUrl(card) });
     }
+    // For 404 we drop into bare entity lookup; for 5xx/timeouts we try the
+    // entity-direct fallback before failing.
     if (cardResp.status !== 404) {
+      const direct = await tryDirectFromEntityId(entityId, ctl.signal);
+      if (direct) return cacheAndReturn(entityId, direct);
       const body = await cardResp.text().catch(() => "");
       throw new RegistryError(
         `GET /v1/entities/${entityId}/card -> HTTP ${cardResp.status}: ${body || cardResp.statusText}`,
@@ -99,16 +116,57 @@ export async function getEntityCard(entityId: string): Promise<HydratedCard> {
         500,
       );
     }
-    // Hydrate by hitting the entity's well-known A2A card. Try the new path
-    // first (post-A2A) and fall back to the legacy path for older agents.
+    // Hydrate by hitting the entity's well-known A2A card.
     const card = await fetchWellKnownCard(entityUrlGuess, ctl.signal);
-    return { card, entityUrl: deriveEntityUrl(card) ?? entityUrlGuess };
+    return cacheAndReturn(entityId, {
+      card,
+      entityUrl: deriveEntityUrl(card) ?? entityUrlGuess,
+    });
   } catch (err) {
     if (err instanceof RegistryError) throw err;
     throw mapError(err);
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Last-resort: when the registry is unreachable, attempt to recover the
+ * card if `entityId` happens to be (or contains) a usable base URL. Returns
+ * null when there's nothing to try — caller raises the original error.
+ */
+async function tryDirectFromEntityId(
+  entityId: string,
+  signal: AbortSignal,
+): Promise<HydratedCard | null> {
+  const httpsMatch = entityId.match(/https?:\/\/[^\s]+/);
+  if (!httpsMatch) return null;
+  try {
+    const card = await fetchWellKnownCard(httpsMatch[0], signal);
+    return { card, entityUrl: deriveEntityUrl(card) ?? httpsMatch[0] };
+  } catch {
+    return null;
+  }
+}
+
+// In-process card cache — registry call → 60s TTL. Same MCP-server lifetime.
+// Keyed by entity_id; also keyed by entity_url for direct fetches.
+const CARD_CACHE_TTL_MS = 60_000;
+const cardCache = new Map<string, { card: HydratedCard; expiresAt: number }>();
+
+function readCardCache(key: string): HydratedCard | null {
+  const hit = cardCache.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt < Date.now()) {
+    cardCache.delete(key);
+    return null;
+  }
+  return hit.card;
+}
+
+function cacheAndReturn(key: string, card: HydratedCard): HydratedCard {
+  cardCache.set(key, { card, expiresAt: Date.now() + CARD_CACHE_TTL_MS });
+  return card;
 }
 
 /** Try the A2A well-known path first, fall back to legacy. */

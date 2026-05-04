@@ -31,12 +31,18 @@ Tip: call zyndai_get_agent first to read the agent's input_schema. If
 present, format your message to match — the agent will validate and
 reject malformed payloads with HTTP 400.
 
+Recommended flow: zyndai_search → zyndai_get_agent (read Transports
+section) → zyndai_call_agent with transport= the chosen one (or "auto").
+
 Args:
   - entity_id (string): zns:… ID from search or resolve.
   - message (string): query/message body (max 10k chars).
   - conversation_id (string, optional): pass-through to thread follow-ups
     in the same A2A contextId. Pass back the value from a prior reply to
     keep context.
+  - mode (auto|sync|push, optional): delivery channel.
+  - transport (auto|JSONRPC|HTTP+JSON, optional): wire transport.
+    "auto" follows the card's preferredTransport.
 
 Errors:
   - 400 — payload didn't match agent's input_schema.
@@ -57,9 +63,11 @@ Errors:
 
         const result = await callAgent({
           card,
-          message: params.message,
+          ...(params.message !== undefined ? { message: params.message } : {}),
+          ...(params.payload !== undefined ? { payload: params.payload } : {}),
           contextId: params.conversation_id,
           mode: params.mode,
+          transport: params.transport,
         });
 
         // Push mode: the call returns immediately with the kickoff task in
