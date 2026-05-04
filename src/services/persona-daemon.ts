@@ -44,6 +44,10 @@ export interface DaemonHandle {
   internal_port: number;
   entity_url: string;
   registry_url: string;
+  /** PID of the auto-spawned tunnel (cloudflared / ngrok), if any. */
+  tunnel_pid?: number;
+  /** Which tunnel binary is forwarding traffic. */
+  tunnel_type?: "cloudflared" | "ngrok";
 }
 
 export interface SpawnOpts {
@@ -56,6 +60,9 @@ export interface SpawnOpts {
   serverPort: number;
   internalPort: number;
   pricing?: { amount_usd: number; currency: string };
+  /** PID + type of an auto-spawned tunnel — recorded so killDaemon can tear it down. */
+  tunnelPid?: number;
+  tunnelType?: "cloudflared" | "ngrok";
 }
 
 const HANDLE_FILE = "mcp-persona.json";
@@ -174,12 +181,23 @@ export function spawnDaemon(opts: SpawnOpts): DaemonHandle {
     internal_port: opts.internalPort,
     entity_url: opts.entityUrl,
     registry_url: opts.registryUrl,
+    ...(opts.tunnelPid ? { tunnel_pid: opts.tunnelPid } : {}),
+    ...(opts.tunnelType ? { tunnel_type: opts.tunnelType } : {}),
   };
   writeHandle(handle);
   return handle;
 }
 
 export function killDaemon(handle: DaemonHandle): void {
+  // Kill the tunnel first so the runner doesn't continue handling
+  // traffic after the public URL is gone.
+  if (handle.tunnel_pid && isAlive(handle.tunnel_pid)) {
+    try {
+      process.kill(handle.tunnel_pid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+  }
   if (!isAlive(handle.pid)) {
     clearHandle();
     return;

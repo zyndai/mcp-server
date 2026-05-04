@@ -63,6 +63,7 @@ import {
   type DaemonHandle,
 } from "./persona-daemon.js";
 import { install as installLaunchd, isInstalled as launchdInstalled } from "./launchd.js";
+import { startTunnel } from "./tunnel.js";
 
 export interface BootstrapResult {
   developerId: string | null;
@@ -120,25 +121,59 @@ export async function autoBootstrap(): Promise<BootstrapResult> {
     }
   }
 
-  // ---- 2. Active persona ------------------------------------------------
+  // ---- 2. Resolve public URL (env override OR auto-tunnel) --------------
+  //
+  // We need the public URL BEFORE registering / spawning the runner so
+  // the persona's registry record + the runner's served agent-card.json
+  // both reference the right entity_url from the start.
+  //
+  // Order:
+  //   a. ZYNDAI_PERSONA_PUBLIC_URL set → trust the user (their tunnel /
+  //      reverse-proxy / cloud LB)
+  //   b. an auto-tunnel binary is installed → spawn it, use the URL it
+  //      gives us
+  //   c. neither → register with localhost placeholder + warn
+
+  // Allocate the bind port first since the tunnel needs to know it.
+  const existingD = existingDaemon();
+  const serverPort = existingD?.server_port ?? parseIntSafe(
+    process.env["ZYNDAI_PERSONA_SERVER_PORT"] ?? process.env["ZYNDAI_PERSONA_WEBHOOK_PORT"],
+    await pickFreePort(5050),
+  );
+
+  let publicUrl: string | null = process.env["ZYNDAI_PERSONA_PUBLIC_URL"] ?? null;
+  let tunnelHandle: { type: "cloudflared" | "ngrok"; publicUrl: string; pid: number } | null = null;
+
+  if (!publicUrl && !existingD) {
+    log("no ZYNDAI_PERSONA_PUBLIC_URL — trying auto-tunnel...");
+    try {
+      const t = await startTunnel({ port: serverPort });
+      if (t && (t.type === "cloudflared" || t.type === "ngrok")) {
+        tunnelHandle = { type: t.type, publicUrl: t.publicUrl, pid: t.pid };
+        publicUrl = tunnelHandle.publicUrl;
+        log(`auto-tunnel up via ${tunnelHandle.type}: ${publicUrl}`);
+      } else {
+        warnings.push(
+          "Could not auto-tunnel. Install cloudflared (`brew install cloudflared`, or " +
+            "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) " +
+            "for a free anonymous public URL, or install ngrok with NGROK_AUTHTOKEN set. " +
+            "Until then, set ZYNDAI_PERSONA_PUBLIC_URL yourself.",
+        );
+      }
+    } catch (e) {
+      warnings.push(`auto-tunnel failed: ${(e as Error).message}`);
+    }
+  } else if (existingD) {
+    publicUrl = existingD.entity_url;
+  }
+
+  if (!publicUrl) publicUrl = `http://localhost:${serverPort}`;
+
+  // ---- 3. Active persona ------------------------------------------------
   let persona = readActivePersona();
-  const publicUrl = process.env["ZYNDAI_PERSONA_PUBLIC_URL"];
 
   if (!persona) {
-    if (!publicUrl) {
-      // Without a public URL the persona can't be registered usefully.
-      // Fall back to a placeholder so bootstrap proceeds; the user can
-      // call zyndai_update_persona later once the URL is set.
-      const placeholder = "http://localhost:0";
-      warnings.push(
-        "ZYNDAI_PERSONA_PUBLIC_URL not set — registering persona with a placeholder URL. " +
-          "Set the env var (an ngrok / cloudflared / cloud URL pointing at the runner's port) " +
-          "and run zyndai_update_persona when ready.",
-      );
-      persona = await registerFreshPersona(registryUrl, placeholder, warnings);
-    } else {
-      persona = await registerFreshPersona(registryUrl, publicUrl, warnings);
-    }
+    persona = await registerFreshPersona(registryUrl, publicUrl, warnings);
   } else {
     log(`reusing persona ${persona.entity_id} (${persona.agent_name})`);
   }
@@ -147,25 +182,27 @@ export async function autoBootstrap(): Promise<BootstrapResult> {
     return { developerId, persona: null, daemon: null, warnings };
   }
 
-  // ---- 3. Persona-runner daemon -----------------------------------------
-  let daemon: DaemonHandle | null = existingDaemon();
+  // ---- 4. Persona-runner daemon -----------------------------------------
+  let daemon: DaemonHandle | null = existingD;
   if (daemon) {
     log(`reusing daemon pid=${daemon.pid} on port ${daemon.server_port}`);
   } else {
     try {
-      const serverPort = parseIntSafe(
-        process.env["ZYNDAI_PERSONA_SERVER_PORT"] ?? process.env["ZYNDAI_PERSONA_WEBHOOK_PORT"],
-        await pickFreePort(5050),
-      );
       const internalPort = await pickFreePort(serverPort + 1);
       daemon = spawnDaemon({
         entityId: persona.entity_id,
         agentName: persona.agent_name,
         keypairPath: persona.keypair_path,
         registryUrl,
-        entityUrl: publicUrl ?? `http://localhost:${serverPort}`,
+        entityUrl: publicUrl,
         serverPort,
         internalPort,
+        ...(tunnelHandle
+          ? {
+              tunnelPid: tunnelHandle.pid,
+              tunnelType: tunnelHandle.type,
+            }
+          : {}),
       });
       log(`spawned persona-runner pid=${daemon.pid} on port ${serverPort}`);
 

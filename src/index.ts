@@ -66,7 +66,7 @@ import { autoBootstrap } from "./services/bootstrap.js";
 
 const server = new McpServer({
   name: "zyndai-mcp-server",
-  version: "5.0.0",
+  version: "5.1.0",
 });
 
 // Identity
@@ -115,7 +115,7 @@ async function main(): Promise<void> {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("zyndai-mcp-server 5.0.0 (auto-bootstrap, smart channels, push callbacks) running on stdio");
+  console.error("zyndai-mcp-server 5.1.0 (auto-bootstrap, auto-tunnel, smart channels, push callbacks) running on stdio");
 }
 
 main().catch((error: unknown) => {
