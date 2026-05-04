@@ -31,7 +31,11 @@ import {
 import { CALL_AGENT_TIMEOUT_MS, MCP_SENDER_ID } from "../constants.js";
 import { getPaymentFetchAsync } from "./payment.js";
 import { loadActivePersonaKeypair } from "./identity-store.js";
+import { existingDaemon } from "./persona-daemon.js";
+import { registerOutboundTask } from "./outbound-tasks.js";
 import type { AgentCard, CallAgentResult, PaymentInfo } from "../types.js";
+
+export type CallMode = "auto" | "sync" | "stream" | "push";
 
 export interface CallAgentParams {
   card: AgentCard;
@@ -40,6 +44,16 @@ export interface CallAgentParams {
   contextId?: string;
   /** Continue (rather than open) an existing task — used for input-required loopbacks. */
   taskId?: string;
+  /**
+   * Delivery channel for this call:
+   *   "auto"   — pick based on the agent's card capabilities + message size
+   *   "sync"   — message/send blocking (default for most calls)
+   *   "stream" — message/send with streaming (returns first artifact only here)
+   *   "push"   — message/send non-blocking + register a push callback URL.
+   *              Reply lands in ~/.zynd/mcp-async-replies.jsonl when the
+   *              agent settles. Use zyndai_async_replies to fetch.
+   */
+  mode?: CallMode;
 }
 
 export async function callAgent({
@@ -47,6 +61,7 @@ export async function callAgent({
   message,
   contextId,
   taskId,
+  mode = "auto",
 }: CallAgentParams): Promise<CallAgentResult> {
   const endpoint = resolveA2AEndpoint(card);
 
@@ -102,18 +117,64 @@ export async function callAgent({
     return resp;
   }) as typeof fetch;
 
+  // Resolve effective mode + push config once.
+  const effectiveMode = resolveMode(mode, card, message);
+  const pushCfg =
+    effectiveMode === "push" ? buildPushConfig(persona?.persona.entity_id) : null;
+
   let task: ATask;
   try {
-    task = await client.sync({
-      url: endpoint,
-      text: message,
-      contextId: conversationId,
-      ...(taskId ? { taskId } : {}),
-      blocking: true,
-      timeoutMs: CALL_AGENT_TIMEOUT_MS,
-    });
+    if (effectiveMode === "push" && pushCfg) {
+      // Non-blocking — agent ack's the kickoff and shuts the connection.
+      // The eventual result lands at our callback URL via the persona-runner.
+      task = await client.sync({
+        url: endpoint,
+        text: message,
+        contextId: conversationId,
+        ...(taskId ? { taskId } : {}),
+        blocking: false,
+        timeoutMs: 30_000,
+        // @ts-expect-error - configuration.pushNotificationConfig is the
+        // A2A spec-mandated inline registration shape; the SDK forwards
+        // it as an opaque pass-through under params.configuration.
+        configuration: {
+          blocking: false,
+          pushNotificationConfig: {
+            url: pushCfg.url,
+            token: pushCfg.token,
+          },
+        },
+      });
+    } else {
+      // Default: sync. (Streaming would return the same final artifact
+      // here — the MCP tool surface doesn't expose intermediate progress
+      // events.)
+      task = await client.sync({
+        url: endpoint,
+        text: message,
+        contextId: conversationId,
+        ...(taskId ? { taskId } : {}),
+        blocking: true,
+        timeoutMs: CALL_AGENT_TIMEOUT_MS,
+      });
+    }
   } finally {
     globalThis.fetch = originalFetch;
+  }
+
+  // For push mode, also register the outbound taskId so the runner can
+  // recognize the eventual callback as ours.
+  if (effectiveMode === "push" && pushCfg) {
+    registerOutboundTask({
+      task_id: task.id,
+      context_id: task.contextId ?? conversationId,
+      target_url: endpoint,
+      target_entity_id: (card.entity_id as string) ?? endpoint,
+      outbound_message: message,
+      callback_url: pushCfg.url,
+      callback_token: pushCfg.token,
+      registered_at: new Date().toISOString(),
+    });
   }
 
   const responseText = taskReplyText(task) ?? "";
@@ -133,6 +194,56 @@ export async function callAgent({
     payment,
     signatureVerified,
   };
+}
+
+/**
+ * Pick a delivery mode when the caller passed "auto":
+ *
+ *   - Push, when the target advertises `capabilities.pushNotifications`
+ *     AND the message is "long-job-shaped" (>2KB, mentions long-running
+ *     verbs). Push avoids holding open a long sync HTTP call.
+ *   - Sync, in every other case.
+ *
+ * This is intentionally simple — wrong choice rarely hurts (sync just
+ * holds the connection longer; push just delays the reply by one
+ * round-trip). The caller can always force a mode explicitly.
+ */
+function resolveMode(mode: CallMode, card: AgentCard, message: string): CallMode {
+  if (mode !== "auto") return mode;
+
+  const caps = (card as { capabilities?: { pushNotifications?: boolean } }).capabilities;
+  const pushSupported = caps?.pushNotifications === true;
+  if (!pushSupported) return "sync";
+
+  // Long-job heuristics: message is large OR mentions phrases that
+  // suggest the work won't return in a few seconds.
+  if (message.length > 2_000) return "push";
+  if (/\b(transcribe|render|generate.*video|train|crawl|scrape entire)\b/i.test(message)) {
+    return "push";
+  }
+
+  return "sync";
+}
+
+/**
+ * Build a push-callback config pointing at our local persona-runner.
+ * Returns null when no runner is alive — push mode doesn't make sense
+ * without somewhere for the callback to land.
+ */
+function buildPushConfig(_personaId: string | undefined): {
+  url: string;
+  token: string;
+} | null {
+  const daemon = existingDaemon();
+  if (!daemon) return null;
+
+  // The runner's A2A endpoint IS the callback URL — push payloads are
+  // signed A2A messages, and the runner already knows how to verify +
+  // route them (via outbound-tasks ledger lookup).
+  const url = `${daemon.entity_url.replace(/\/+$/, "")}/a2a/v1`;
+  // Ed25519-derived nonce so each call gets a fresh shared secret.
+  const token = randomUUID();
+  return { url, token };
 }
 
 /**

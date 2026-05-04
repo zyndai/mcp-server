@@ -59,7 +59,34 @@ Errors:
           card,
           message: params.message,
           contextId: params.conversation_id,
+          mode: params.mode,
         });
+
+        // Push mode: the call returns immediately with the kickoff task in
+        // a non-terminal state. Surface this clearly so Claude doesn't try
+        // to read the response field — that comes back later.
+        if (
+          (params.mode === "push" || params.mode === "auto") &&
+          result.taskState !== "completed" &&
+          result.taskState !== "failed" &&
+          result.taskState !== "canceled"
+        ) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `**Push notification armed.**\n\n` +
+                  `Sent to: \`${result.agentName}\` (\`${result.entityId}\`)\n` +
+                  `Task ID: \`${result.taskId}\`\n` +
+                  `Conversation: \`${result.contextId}\`\n` +
+                  `State: ${result.taskState}\n\n` +
+                  `The agent will POST its reply to the persona-runner when it finishes. ` +
+                  `Use \`zyndai_async_replies\` to check for the result, or filter by this task ID.`,
+              },
+            ],
+          };
+        }
 
         return {
           content: [

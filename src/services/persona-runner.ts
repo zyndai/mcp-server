@@ -49,6 +49,7 @@ import {
   type TaskHandle,
 } from "zyndai";
 import { appendEntry, findEntry, updateStatus, type MailboxEntry } from "./mailbox.js";
+import { findOutboundTask, recordAsyncReply } from "./outbound-tasks.js";
 
 if (!globalThis.crypto) {
   (globalThis as Record<string, unknown>).crypto = webcrypto;
@@ -127,6 +128,48 @@ async function main(): Promise<void> {
     const senderPublicKey = message.senderPublicKey;
     const messageId = message.messageId;
     const contextId = message.conversationId;
+
+    // ---- Distinguish push callbacks from fresh inbound -------------------
+    //
+    // Two shapes of inbound traffic land here:
+    //
+    //   1. A fresh message from another agent who wants to talk to the
+    //      user → file in the mailbox, ack, wait for human review.
+    //   2. A push notification for a task Claude initiated → look up our
+    //      outbound-task ledger, capture the result, ack quietly. No
+    //      human review needed because Claude was the one who asked.
+    //
+    // The wire shape of a push callback is a signed A2A message wrapping
+    // a `status-update` event in a DataPart. Detect that, and if the
+    // referenced taskId matches one we registered, route as a callback.
+    const callbackEvent = detectPushCallback(message);
+    if (callbackEvent) {
+      const ours = findOutboundTask(callbackEvent.taskId);
+      if (ours) {
+        const reply =
+          callbackEvent.replyText ?? null;
+        recordAsyncReply({
+          task_id: callbackEvent.taskId,
+          context_id: callbackEvent.contextId,
+          state: callbackEvent.state,
+          reply,
+          received_at: new Date().toISOString(),
+          status_timestamp: callbackEvent.timestamp,
+        });
+        log("push-callback", {
+          task_id: callbackEvent.taskId,
+          state: callbackEvent.state,
+          target: ours.target_entity_id,
+        });
+        return { response: "ack: callback recorded" };
+      }
+      // It looks like a callback but wasn't for one of our tasks — fall
+      // through to the human-review path so the user can decide.
+      log("unknown-callback", {
+        task_id: callbackEvent.taskId,
+        sender: senderEntityId,
+      });
+    }
 
     const entry: MailboxEntry = {
       message_id: messageId,
@@ -290,6 +333,87 @@ function pickSenderA2AEndpoint(card: Record<string, unknown> | null): string | n
   if (typeof entityUrl === "string" && entityUrl) {
     return `${entityUrl.replace(/\/+$/, "")}/a2a/v1`;
   }
+  return null;
+}
+
+/**
+ * Inspect an incoming AgentMessage to see if it's a push-notification
+ * callback (i.e. a `status-update` event the deployer / SDK emits when
+ * a task settles). Returns the parsed event or null when it doesn't
+ * look like one.
+ *
+ * The push payload format is documented in zyndai-agent's a2a/server.py
+ * `_deliver_push_if_configured` — a signed A2A message whose only part
+ * is a DataPart with `kind: "status-update"`, carrying taskId / contextId
+ * / status / final.
+ */
+function detectPushCallback(message: {
+  metadata?: Record<string, unknown> | null;
+  taskId?: string;
+  conversationId?: string;
+  content?: string;
+}): {
+  taskId: string;
+  contextId: string;
+  state: string;
+  timestamp: string | null;
+  replyText: string | null;
+} | null {
+  const meta = (message.metadata ?? {}) as Record<string, unknown>;
+
+  // Some SDKs (the Python A2AClient.sync push delivery) inline the
+  // status-update under metadata.parts; others put it in the content
+  // (after the adapter joined data parts into a JSON string fallback).
+  // We look at both.
+
+  // Case A: metadata carries a parsed `data` field with kind=status-update.
+  for (const candidate of [meta["data"], meta["status-update"], meta["status_update"]]) {
+    if (candidate && typeof candidate === "object") {
+      const event = candidate as Record<string, unknown>;
+      if (event["kind"] === "status-update" && typeof event["taskId"] === "string") {
+        return {
+          taskId: event["taskId"] as string,
+          contextId:
+            (event["contextId"] as string | undefined) ??
+            message.conversationId ??
+            "",
+          state:
+            ((event["status"] as Record<string, unknown> | undefined)?.["state"] as string) ??
+            "unknown",
+          timestamp:
+            ((event["status"] as Record<string, unknown> | undefined)?.["timestamp"] as string) ??
+            null,
+          replyText: null,
+        };
+      }
+    }
+  }
+
+  // Case B: the content was JSON.stringify-ed by the inbound adapter.
+  if (typeof message.content === "string" && message.content.trim().startsWith("{")) {
+    try {
+      const obj = JSON.parse(message.content) as Record<string, unknown>;
+      if (obj["kind"] === "status-update" && typeof obj["taskId"] === "string") {
+        return {
+          taskId: obj["taskId"] as string,
+          contextId:
+            (obj["contextId"] as string | undefined) ??
+            message.conversationId ??
+            "",
+          state:
+            ((obj["status"] as Record<string, unknown> | undefined)?.["state"] as string) ??
+            "unknown",
+          timestamp:
+            ((obj["status"] as Record<string, unknown> | undefined)?.["timestamp"] as string) ??
+            null,
+          replyText: null,
+        };
+      }
+    } catch {
+      // not JSON — not a callback
+    }
+  }
+
   return null;
 }
 

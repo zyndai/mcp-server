@@ -154,6 +154,15 @@ export const CallAgentSchema = z
       .describe(
         "Optional conversation ID for multi-turn — pass back the value from a prior response to keep context.",
       ),
+    mode: z
+      .enum(["auto", "sync", "push"])
+      .default("auto")
+      .describe(
+        "Delivery channel: " +
+          "'sync' blocks the call until the agent finishes (best for quick replies); " +
+          "'push' fires-and-forgets — the agent POSTs the result to your persona-runner when done, and you fetch it later via zyndai_async_replies (best for long jobs); " +
+          "'auto' (default) inspects the agent card's capabilities + the message size and picks. Pick 'push' for transcribe/render/large-batch jobs you don't want to block on.",
+      ),
   })
   .strict();
 

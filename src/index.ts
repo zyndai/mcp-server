@@ -60,10 +60,13 @@ import { registerCallAgent } from "./tools/call-agent.js";
 // Inbox — incoming messages other agents send to this persona.
 import { registerPendingRequestsTool } from "./tools/pending-requests.js";
 import { registerRespondToRequestTool } from "./tools/respond-to-request.js";
+import { registerAsyncRepliesTool } from "./tools/async-replies.js";
+
+import { autoBootstrap } from "./services/bootstrap.js";
 
 const server = new McpServer({
   name: "zyndai-mcp-server",
-  version: "3.0.0",
+  version: "5.0.0",
 });
 
 // Identity
@@ -83,11 +86,36 @@ registerCallAgent(server);
 // Inbox
 registerPendingRequestsTool(server);
 registerRespondToRequestTool(server);
+registerAsyncRepliesTool(server);
 
 async function main(): Promise<void> {
+  // Auto-bootstrap before starting the stdio loop. If the developer
+  // keypair is missing this triggers an interactive browser auth flow;
+  // if a persona isn't registered yet it derives + registers one and
+  // spawns the persona-runner. All steps are best-effort — bootstrap
+  // failures don't block MCP startup, they just leave write-tools
+  // (call_agent, inbox) inoperative until the user reruns the failed
+  // step manually.
+  try {
+    const result = await autoBootstrap();
+    if (result.persona) {
+      console.error(
+        `[mcp] persona ready: ${result.persona.agent_name} (${result.persona.entity_id})`,
+      );
+    }
+    if (result.daemon) {
+      console.error(
+        `[mcp] persona-runner alive on port ${result.daemon.server_port} (pid ${result.daemon.pid})`,
+      );
+    }
+    for (const w of result.warnings) console.error(`[mcp] warn: ${w}`);
+  } catch (err) {
+    console.error(`[mcp] auto-bootstrap threw: ${(err as Error).message}`);
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("zyndai-mcp-server 3.0.0 (AgentDNS, live persona-runner) running on stdio");
+  console.error("zyndai-mcp-server 5.0.0 (auto-bootstrap, smart channels, push callbacks) running on stdio");
 }
 
 main().catch((error: unknown) => {

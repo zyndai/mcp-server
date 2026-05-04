@@ -1,7 +1,7 @@
 {
   "name": "zynd-mcp-server",
-  "version": "4.0.0",
-  "description": "MCP server for the AgentDNS network on ZyndAI — search, browse, resolve and call agents over A2A with x402 micropayments",
+  "version": "5.0.0",
+  "description": "MCP server that turns Claude into a Zynd network agent: auto-bootstraps developer + persona, runs a parallel inbox for incoming A2A traffic, lets Claude call other agents over sync/push channels, and recognizes push-callback replies from tasks Claude initiated.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
